@@ -182,4 +182,4 @@ steps:
       MODE=upload \
       OUTPUT_FOLDER="$GOOGLE_DRIVE_OUTPUT_FOLDER_ID" \
       IPA_PATH="$RUNNER_TEMP/output/MetroidDread.ipa" \
-      .venv/bin/python "$RUNNER_TEMP/drive.py"
+      .venv/bin/python "$RUNNER_TEMP/drive.py
