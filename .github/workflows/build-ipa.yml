@@ -20,10 +20,9 @@ steps:
       brew install xcodegen zstd spirv-cross
       brew install --cask dotnet-sdk
 
-  - name: Update shader tool lock
+  - name: Check shader tool versions
     run: |
-      python3 dm/gfx/tools/dmsh_chain.py --update-lock
-      git diff -- dm/gfx/tools/dmsh_chain.lock
+      python3 dm/gfx/tools/dmsh_chain.py --check-tools
 
   - name: Install Python dependencies
     run: |
@@ -182,4 +181,4 @@ steps:
       MODE=upload \
       OUTPUT_FOLDER="$GOOGLE_DRIVE_OUTPUT_FOLDER_ID" \
       IPA_PATH="$RUNNER_TEMP/output/MetroidDread.ipa" \
-      .venv/bin/python "$RUNNER_TEMP/drive.py
+      .venv/bin/python "$RUNNER_TEMP/drive.py"
