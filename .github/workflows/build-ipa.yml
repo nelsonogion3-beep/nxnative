@@ -1,4 +1,4 @@
-name: nxnative build test
+name: nxnative IPA build
 
 on:
   workflow_dispatch:
@@ -7,24 +7,26 @@ permissions:
   contents: read
 
 jobs:
-  prepare:
+  build:
     runs-on: macos-15
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Check Xcode
-        run: xcodebuild -version
-
-      - name: Check Python
+      - name: Install build tools
         run: |
-          python3 --version
+          brew install xcodegen zstd spirv-cross
+          brew install --cask dotnet-sdk
+
+      - name: Install Python dependencies
+        run: |
           python3 -m venv .venv
           .venv/bin/python -m pip install --upgrade pip
           .venv/bin/python -m pip install lz4 capstone fonttools
 
-      - name: Check project files
+      - name: Verify build script
         run: |
-          ls -la
-          find . -name 'build_ipa_from_nsp.py'
+          test -f scripts/build_ipa_from_nsp.py
+          .venv/bin/python scripts/build_ipa_from_nsp.py -h
