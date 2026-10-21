@@ -1,19 +1,24 @@
       - name: Diagnose shader tools
+        continue-on-error: true
         env:
           DM_GAME: "010093801237C000"
         run: |
           echo "=== Xcode ==="
-          xcodebuild -version
+          xcodebuild -version || true
+          ls /Applications | grep -i xcode || true
 
           echo "=== Metal ==="
-          xcrun --sdk macosx metal --version
-          xcrun --sdk iphoneos metal --version
+          xcrun --sdk macosx metal --version || true
+          xcrun --sdk iphoneos metal --version || true
 
           echo "=== SPIRV-Cross ==="
           spirv-cross --version || true
 
-          echo "=== Shader chain lock ==="
-          cat dm/gfx/tools/dmsh_chain.lock
+          echo "=== Tools dir ==="
+          ls -lah dm/gfx/tools/ || true
 
-          echo "=== Translator files ==="
-          ls -lah dm/gfx/tools/
+          echo "=== Lock file ==="
+          cat dm/gfx/tools/*.lock || true
+
+          echo "=== Help ==="
+          python3 dm/gfx/tools/dmsh_chain.py --help || true
