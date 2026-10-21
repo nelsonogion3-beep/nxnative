@@ -9,18 +9,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Info
+      - name: Metal per ogni Xcode
         shell: bash
         run: |
-          echo "=== Xcode ==="
-          xcodebuild -version || true
-          ls /Applications | grep -i xcode || true
-          echo "=== Metal ==="
-          xcrun --sdk macosx metal --version || true
-          xcrun --sdk iphoneos metal --version || true
-          echo "=== Tools dir ==="
-          ls -lah dm/gfx/tools/ || true
-          echo "=== Lock ==="
-          cat dm/gfx/tools/*.lock || true
-          echo "=== Help ==="
-          python3 dm/gfx/tools/dmsh_chain.py --help || true
+          for x in 26.0 26.1 26.2 26.3; do
+            echo "=== Xcode $x ==="
+            sudo xcode-select -s /Applications/Xcode_$x.app || true
+            xcrun --sdk macosx metal --version 2>&1 | head -1 || true
+            xcrun --sdk iphoneos metal --version 2>&1 | head -1 || true
+          done
+
+      - name: Come ottenere spirv-cross
+        shell: bash
+        run: |
+          echo "=== dmsh_fetch.py ==="
+          cat dm/gfx/tools/dmsh_fetch.py || true
+          echo "=== dmsh_chain.py ==="
+          cat dm/gfx/tools/dmsh_chain.py || true
+          echo "=== dmsh_xlate ==="
+          ls -lah dm/gfx/tools/dmsh_xlate || true
+          echo "=== dmsh_xlate_bin ==="
+          ls dm/gfx/tools/dmsh_xlate_bin | head -30 || true
