@@ -1,11 +1,10 @@
-name: nxnative IPA build
+name: Test
 
-on:
+'on':
 workflow_dispatch:
 
 jobs:
 test:
-runs-on: macos-15
+runs-on: ubuntu-latest
 steps:
-- name: Verify workflow
-run: echo "GitHub Actions funziona correttamente"
+- run: echo "OK"
