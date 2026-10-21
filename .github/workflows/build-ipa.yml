@@ -1,6 +1,6 @@
 name: nxnative IPA build
 
-on:
+'on':
 workflow_dispatch:
 
 permissions:
