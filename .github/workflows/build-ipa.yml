@@ -163,7 +163,7 @@ jobs:
             -k "$RUNNER_TEMP/prod.keys" \
             -o "$RUNNER_TEMP/output/MetroidDread.ipa" \
             --app-name "Metroid Dread" \
-            --progress
+            --progress lines
 
           test -s "$RUNNER_TEMP/output/MetroidDread.ipa"
 
