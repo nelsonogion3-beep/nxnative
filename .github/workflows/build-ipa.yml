@@ -1,24 +1,26 @@
-      - name: Diagnose shader tools
-        continue-on-error: true
-        env:
-          DM_GAME: "010093801237C000"
+name: diag
+
+'on':
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Info
+        shell: bash
         run: |
           echo "=== Xcode ==="
           xcodebuild -version || true
           ls /Applications | grep -i xcode || true
-
           echo "=== Metal ==="
           xcrun --sdk macosx metal --version || true
           xcrun --sdk iphoneos metal --version || true
-
-          echo "=== SPIRV-Cross ==="
-          spirv-cross --version || true
-
           echo "=== Tools dir ==="
           ls -lah dm/gfx/tools/ || true
-
-          echo "=== Lock file ==="
+          echo "=== Lock ==="
           cat dm/gfx/tools/*.lock || true
-
           echo "=== Help ==="
           python3 dm/gfx/tools/dmsh_chain.py --help || true
