@@ -13,6 +13,12 @@
 # Encoded entry: u32 bits (0-5 compression block size >> 11, 0x3f = a u32 follows; 6-21 block count; 22 encrypted; 23-28 compression method, 1-based; 29 stored size fits 32 bits; 30 raw size fits
 #   32 bits; 31 offset fits 32 bits), then offset, raw size, stored size (compressed entries only) and, for several blocks or an encrypted one, each block's u32 stored size. The data starts after
 #   the FPakEntry the pak repeats in front of it (53 bytes, + 4 + 16 per block when compressed); blocks follow each other, 16-aligned when encrypted.
+# Older paks (version 4, UE 4.18: DRAGON QUEST XI S, pakchunk0-Switch.pak 6.6 GB / 264,844 files and pakchunk1-Switch.pak 7.2 GB / 147,824 files, the update's *_0_P.pak beside them) keep the
+#   legacy layout. Footer (the last 0x2d bytes): encrypted index flag (u8), magic, version, index offset, index size, SHA-1. Index: mount point, entry count, then per file its name (relative to the
+#   mount point) and its FPakEntry: offset, stored size, raw size (i64 each), compression flags (i32), SHA-1 (20), for a compressed file the block count (i32) and each block's start and end
+#   (i64, from the file start before version 5, from the entry after), the encrypted flag (u8) and the compression block size (u32). The FPakEntry is repeated in front of the data.
+#   The compression flags are no names: 1 zlib, 2 gzip, 4 custom; DRAGON QUEST XI S's engine uses 3, which is LZ5 2.0 (main exports LZ5_*; every block starts with its level, 0x2d = 45), and only the
+#   game's own decoder reads it (hle_oodle.c, through a decode function given to Pak.read).
 # Shader code archive (version 2): shader map hashes (20 bytes each), shader hashes (20 each), shader map entries {u32 first index, u32 shader count, u32 first preload, u32 preload count}, shader
 #   entries {u64 offset, u32 size, u32 raw size, u8 frequency} (17 bytes, packed), preload entries (16 each), shader indices (u32): each array is a u32 count and its elements; the code follows,
 #   offsets relative to its start. A shader whose size differs from its raw size is compressed.
@@ -58,19 +64,32 @@ class R:
         if n < 0: return self.raw(-2 * n).decode('utf-16-le')[:-1]
         return self.raw(n)[:-1].decode('utf-8', 'replace') if n else ''
 
+LEGACY = (4,)   # legacy pak versions read (the per-file index); 11 has the encoded one
+LEGACY_METHODS = {1: 'Zlib', 2: 'Gzip', 3: 'LZ5', 4: 'Custom'}   # compression flags of a legacy pak (3: DRAGON QUEST XI S's engine, see the header)
+
+def pak_version(f):
+    """The version of a pak: a legacy footer is the last 0x2d bytes (magic 0x2c from the end); version 11's is 0xdd bytes, the magic 0xc8 from the end"""
+    for back in (0x2c, 0xc8):
+        f.seek(-back, 2); m, ver = struct.unpack('<II', f.read(8))
+        if m == PAK_MAGIC: return ver
+    raise ValueError('no pak footer')
+
 def footer(f):
-    f.seek(-0xdd, 2); ft = f.read(0xdd)
-    k = ft.find(struct.pack('<I', PAK_MAGIC))
-    if k < 1: raise ValueError('no pak footer')
-    ver, ioff, isz = struct.unpack_from('<IQQ', ft, k + 4)
-    if ver != 11: raise ValueError(f'pak version {ver}, only 11 is read')
+    """(encrypted index, index offset, index size, compression method names by number from 1, version)"""
+    ver = pak_version(f)
+    if ver in LEGACY:
+        f.seek(-0x2d, 2); ft = f.read(0x2d); ioff, isz = struct.unpack_from('<QQ', ft, 9)
+        return ft[0], ioff, isz, [LEGACY_METHODS.get(i, f'flags {i}') for i in range(1, 8)], ver
+    if ver != 11: raise ValueError(f'pak version {ver}, only {", ".join(map(str, LEGACY))} and 11 are read')
+    f.seek(-0xdd, 2); ft = f.read(0xdd); k = 0xdd - 0xc8
+    ioff, isz = struct.unpack_from('<QQ', ft, k + 8)
     methods = [ft[k + 44 + 32 * i:k + 76 + 32 * i].rstrip(b'\0').decode('latin1') for i in range(5)]
-    return ft[k - 1], ioff, isz, methods
+    return ft[k - 1], ioff, isz, methods, ver
 
 def find_key(img, lo, hi, pak):
     """The AES key among main's 32-byte windows (read-only and data segments, 4-aligned, at least 20 distinct bytes): the one that decrypts the index start to a short mount point"""
     with open(pak, 'rb') as f:
-        _, ioff, _, _ = footer(f); f.seek(ioff); blk = f.read(16)
+        _, ioff, _, _, _ = footer(f); f.seek(ioff); blk = f.read(16)
     for a in range(lo, hi - 32, 4):
         w = img[a:a + 32]
         if len(set(w)) < 20: continue
@@ -81,10 +100,21 @@ def find_key(img, lo, hi, pak):
 class Pak:
     def __init__(self, path, key=None):
         self.path, self.key = path, key; self.f = open(path, 'rb')
-        enc, ioff, isz, self.methods = footer(self.f)
+        enc, ioff, isz, self.methods, self.version = footer(self.f)
         if enc and not key: raise ValueError(f'{path}: the index is encrypted and no key was given')
         r = R(self.read_at(ioff, isz, enc))
-        self.mount = r.fstr(); self.count = r.take('<i'); r.take('<Q')
+        self.mount = r.fstr(); self.count = r.take('<i')
+        if self.version in LEGACY:   # one FPakEntry per file, kept as parsed
+            self.files = {}
+            for _ in range(self.count):
+                name = r.fstr(); off, size, raw, meth = r.take('<qqqi'); r.raw(20)
+                blocks = [r.take('<qq') for _ in range(r.take('<i'))] if meth else []
+                e, bsz = r.take('<BI'); head = 53 + (4 + 16 * len(blocks) if meth else 0)
+                if self.version < 5: blocks = [(s - off, t - s) for s, t in blocks]
+                else: blocks = [(s, t - s) for s, t in blocks]
+                self.files[name] = dict(off=off, raw=raw, size=size, method=self.methods[meth - 1] if meth else '', encrypted=e, block_size=bsz, blocks=blocks or [(head, size)])
+            return
+        r.take('<Q')
         if r.take('<i'): r.take('<QQ'); r.raw(20)   # path hash index (not needed with the full directory index)
         if not r.take('<i'): raise ValueError(f'{path}: no full directory index')
         doff, dsz = r.take('<QQ'); r.raw(20)
@@ -98,6 +128,7 @@ class Pak:
         self.f.seek(off); b = self.f.read((n + 15) & ~15 if enc else n)
         return aes_decrypt(self.key, b)[:n] if enc else b
     def entry(self, path):
+        if self.version in LEGACY: return self.files[path]
         r = R(self.enc, self.files[path]); v = r.take('<I')
         bsz = (v & 0x3f) << 11
         if v & 0x3f == 0x3f: bsz = r.take('<I')
@@ -109,11 +140,16 @@ class Pak:
         else:
             for _ in range(nblk): s = r.take('<I'); blocks.append((cur, s)); cur += (s + 15) & ~15 if enc else s
         return dict(off=off, raw=raw, size=size, method=self.methods[meth - 1] if meth else '', encrypted=enc, block_size=bsz, blocks=blocks)
-    def read(self, path):
-        """A stored file's bytes (compressed files need the Oodle job)"""
+    def read(self, path, decode=None):
+        """A file's bytes. A compressed one needs decode(block bytes, raw length) → bytes, block by block (each block holds block_size raw bytes, the last one the rest):
+        the game's own decoder in the Mac host (shader_split.py oodle); Octopath Traveler 0's archives go through the Oodle job instead"""
         e = self.entry(path)
-        if e['method']: raise ValueError(f'{path} is {e["method"]}-compressed in the pak')
-        return self.read_at(e['off'] + 53, e['size'], e['encrypted'])
+        if not e['method']: return self.read_at(e['off'] + 53, e['size'], e['encrypted'])
+        if not decode: raise ValueError(f'{path} is {e["method"]}-compressed in the pak')
+        out, left = [], e['raw']
+        for s, n in e['blocks']:
+            k = min(left, e['block_size']); out.append(decode(self.read_at(e['off'] + s, n, e['encrypted']), k)); left -= k
+        return b''.join(out)
 
 def archive(b):
     """A shader code archive's tables: {'maps': [(first index, count)], 'shaders': [(offset, size, raw size, frequency)], 'indices': [...], 'code': start of the code}"""
@@ -142,21 +178,22 @@ def paks(romfs):
     """Every pak under the RomFS"""
     return sorted(os.path.join(dp, f) for dp, _, fs in os.walk(romfs) for f in fs if f.endswith('.pak'))
 
-def unreal_paks(romfs):
-    """The paks under the RomFS that Unreal wrote (its magic in the footer, any version): a game whose shaders the NSP script decodes (decode_ue_shaders) and shader_split.py reads"""
+def unreal_paks(romfs, legacy=None):
+    """The paks under the RomFS that Unreal wrote (its magic in the footer; legacy None = any version, True = the legacy versions, False = the others): with version 11 the NSP script decodes
+    the shader code archives (decode_ue_shaders); legacy paks keep the shaders inline in the cooked packages, which shader_split.py reads through the game's decoder (ue_legacy_jobs)"""
     out = []
     for p in paks(romfs):
         try:
-            with open(p, 'rb') as f: f.seek(-0xdd, 2); ft = f.read(0xdd)
-        except OSError: continue   # shorter than a footer
-        if ft.find(struct.pack('<I', PAK_MAGIC)) >= 1: out.append(p)
+            with open(p, 'rb') as f: ver = pak_version(f)
+        except (OSError, ValueError, struct.error): continue   # shorter than a footer, or no Unreal pak
+        if legacy is None or (ver in LEGACY) == legacy: out.append(p)
     return out
 
 def job(romfs, main_nso, work):
     """The shader code archives of every pak under the RomFS into <work>/archives, and one Oodle job (<work>/oodle.job) of every compressed shader in them; <work>/job.json lists them"""
     os.makedirs(os.path.join(work, 'archives'), exist_ok=True)
     img, lo, hi = nso_image(main_nso); key = None; listing, recs = [], []
-    for pak in paks(romfs):
+    for pak in unreal_paks(romfs, legacy=False):
         with open(pak, 'rb') as f: enc = footer(f)[0]
         if enc and key is None:
             key = find_key(img, lo, hi, pak)
@@ -214,7 +251,8 @@ if __name__ == '__main__':
             f.write('path\traw\tstored\tmethod\tencrypted\tblocks\n')
             for path in sorted(p.files):
                 e = p.entry(path); f.write(f"{path}\t{e['raw']}\t{e['size']}\t{e['method'] or 'none'}\t{e['encrypted']}\t{len(e['blocks'])}\n")
-        print(f'pak version 11, mount {p.mount}, {len(p.files)} files, compression {[m for m in p.methods if m]}')
+        used = sorted({p.entry(x)['method'] for x in p.files} - {''})
+        print(f'pak version {p.version}, mount {p.mount}, {len(p.files)} files, compression {used}')
     elif cmd == 'job':
         listing, n = job(*sys.argv[2:5])
         for x in listing: print(f"{x['name']}: {x['shaders']} shaders, {x['compressed']} compressed")

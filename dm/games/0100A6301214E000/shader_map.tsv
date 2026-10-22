@@ -1,4 +1,4 @@
-# kind: evidence  Fire Emblem Engage shaders (BNSH / BAHS in RomFS + main) → control section + code area keys (dm/gfx/tools/shader_split.py)
+# kind: evidence  Fire Emblem Engage shaders (Unity Shader / GLSLC in RomFS + main) → control section + code area keys (dm/gfx/tools/shader_split.py)
 # column 5 records where each key first appears; this game has no PC version to pair with
 package	index	stage	dm_ctl_sha16	source
 vs_assets.bin	0	vertex	e4380a96cd6d4e26	/Data/StreamingAssets/aa/Switch/fe_assets_customrp/shaders/chara/charabmap.shader.bundle:CAB-423c485d6ec607f28fe919d91195b2d6#CustomRP/Chara/CharaBmap#var19.0
@@ -9270,3 +9270,14 @@ ps_engine.bin	465	pixel	1c754d2b874ececd	/Data/data.unity3d:resources.assets#Tex
 vs_engine.bin	465	vertex	e36f5c784c696e70	/Data/data.unity3d:resources.assets#TextMeshPro/Mobile/Distance Field#var19.7
 ps_engine.bin	466	pixel	3430bf71eeb54381	/Data/data.unity3d:resources.assets#TextMeshPro/Mobile/Distance Field#var19.8
 vs_engine.bin	466	vertex	b86aadbcfc86de8b	/Data/data.unity3d:resources.assets#TextMeshPro/Mobile/Distance Field#var19.8
+vs_main.bin	0	vertex	24e4cd391d993137	main#GLSLC@0x5098d80
+vs_main.bin	1	vertex	d19b47f9ea5c3cfe	main#GLSLC@0x5099940
+ps_main.bin	0	pixel	17b082dfef30eba9	main#GLSLC@0x509a600
+ps_main.bin	1	pixel	889465df59838dc0	main#GLSLC@0x509b2c0
+ps_main.bin	2	pixel	e46f75eec323df1d	main#GLSLC@0x509c080
+ps_main.bin	3	pixel	a23dda46c07f800d	main#GLSLC@0x509cf40
+ps_main.bin	4	pixel	bf76784f461275c7	main#GLSLC@0x509dc00
+ps_main.bin	5	pixel	abcdb66b44f1313d	main#GLSLC@0x509e9c0
+vs_main.bin	2	vertex	f3a2af4f812f7366	main#GLSLC@0x509f880
+ps_main.bin	6	pixel	987c069874bbe974	main#GLSLC@0x50a0440
+cs_main.bin	0	compute	552bbc8ffc2459e4	main#GLSLC@0x50a1000

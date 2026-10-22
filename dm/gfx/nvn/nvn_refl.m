@@ -49,16 +49,17 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
             // SPIRV-Cross's MSL 2.3 image atomics: the image (texture_buffer / texture2d… <uint> or <int>) and, for the atomics, a device pointer to the same memory, <image name>_atomic, which the build
             // reads as a second image of the same slot. Octopath Traveler 0: 2,084 shaders (Unreal's buffer images: cp_i_cb2_4C_r32ui_atomic)
             if ([k isEqualToString:@"img"] && reg >= 0 && [nm isKindOfClass:[NSString class]] && [nm hasSuffix:@"_atomic"] && [ty isKindOfClass:[NSString class]] && [ty hasPrefix:@"device atomic_"]) {
-                r->kind = NVN_RB_IMGA; o->nb++; continue;
+                r->kind = NVN_RB_IMGA; r->rw = 1; o->nb++; continue;
             }
             if ([k isEqualToString:@"cbuf"]) r->kind = NVN_RB_CBUF;
             else if ([k isEqualToString:@"samp"]) r->kind = NVN_RB_SAMP;
             else if ([k isEqualToString:@"samp_tex"]) r->kind = NVN_RB_SAMPT;
-            else if ([k isEqualToString:@"tex"]) { r->kind = NVN_RB_TEX; dummy_kind(b[@"msl_type"], &r->dtt, &r->dpf); }
+            else if ([k isEqualToString:@"tex"]) { r->kind = NVN_RB_TEX; dummy_kind(b[@"msl_type"], &r->dtt, &r->dpf); r->f1d = [b[@"fetch1d"] boolValue]; }
             else if ([k isEqualToString:@"tex_ubo"]) { r->kind = NVN_RB_TEXU; dummy_kind(b[@"msl_type"], &r->dtt, &r->dpf); r->off = (uint16_t)[b[@"off"] intValue]; o->bindless = 1; }
             else if ([k isEqualToString:@"samp_ubo"]) { r->kind = NVN_RB_SAMPU; r->off = (uint16_t)[b[@"off"] intValue]; o->bindless = 1; }
             else if ([k isEqualToString:@"samp_id"]) r->kind = NVN_RB_SAMPI;
-            else if ([k isEqualToString:@"img"]) { r->kind = NVN_RB_IMG; dummy_kind(b[@"msl_type"], &r->dtt, &r->dpf); }
+            else if ([k isEqualToString:@"img"]) { r->kind = NVN_RB_IMG; dummy_kind(b[@"msl_type"], &r->dtt, &r->dpf);   // rw: the shader writes it (access::write / read_write; a load-only view of the slot is not)
+                r->rw = [ty isKindOfClass:[NSString class]] && ([ty containsString:@"access::write"] || [ty containsString:@"access::read_write"]); }
             else if ([k isEqualToString:@"tbuf"]) { r->kind = NVN_RB_TBUF; uint8_t tt; dummy_kind(b[@"msl_type"], &tt, &r->dpf); }
             else if ([k isEqualToString:@"sbuf"]) { r->kind = NVN_RB_SBUFP; r->rw = sbuf_rw(b); }
             else if ([k isEqualToString:@"ubo_ptr"]) r->kind = NVN_RB_UBOP;
@@ -87,7 +88,22 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
             if (loc < 0 || loc >= NVN_REFL_MAXV || o->nv >= NVN_REFL_MAXV) FAIL("B vertex input %d out of range", loc);
             o->v[o->nv].loc = o->v[o->nv].nvn = (uint8_t)loc;
             o->v[o->nv].ct = [t hasPrefix:@"uint"] ? NVN_CT_UINT : [t hasPrefix:@"int"] ? NVN_CT_INT : NVN_CT_FLOAT;
+            memset(o->v[o->nv].sh, 0xff, sizeof o->v[o->nv].sh);
             o->nv++;
+        }
+        NSDictionary *vin = j[@"vin"];   // shadow inputs of the <key>_bv library (dmsh_vin.py): per input, the Metal attribute index of its float / other-sign declaration
+        if ([vin isKindOfClass:[NSDictionary class]]) {
+            uint32_t used = 0;
+            for (NSDictionary *e in vin[@"shadow"]) {
+                int loc = [e[@"location"] intValue], v = 0;
+                while (v < o->nv && o->v[v].loc != loc) v++;
+                if (v == o->nv || o->v[v].ct == NVN_CT_FLOAT) FAIL("shadow input for location %d, which is not an integer input", loc);
+                const struct { NSString *k; int ct; } T[3] = { { @"float", NVN_CT_FLOAT }, { @"sint", NVN_CT_INT }, { @"uint", NVN_CT_UINT } };
+                for (int q = 0; q < 3; q++) { id x = e[T[q].k]; if (!x) continue; int idx = [x intValue];
+                    if (idx < 16 || idx > 30 || used >> idx & 1 || T[q].ct == o->v[v].ct) FAIL("shadow input %s of location %d at attribute %d: out of 16-30, used twice or of the input's own type", T[q].k.UTF8String, loc, idx);
+                    used |= 1u << idx; o->v[v].sh[T[q].ct] = (uint8_t)idx; }
+            }
+            o->has_vin = used != 0;
         }
         NSDictionary *ra = j[@"raster"];
         o->pos_attr = -1; o->may_discard = 1; o->writes_smask = 1;

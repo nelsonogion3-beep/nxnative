@@ -46,3 +46,7 @@ t_vbuf
 t_vbuf.dSYM/
 t_dirty_race
 t_dirty_race.dSYM/
+t_vin
+t_vin.dSYM/
+t_tbuf2d
+t_tbuf2d.dSYM/

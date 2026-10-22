@@ -422,6 +422,15 @@ namespace Ryujinx.Graphics.Shader
         }
 
         /// <summary>
+        /// nxnative: a 1D integer-coordinate fetch (TLD / TLDS 1D) of the bound texture handle was translated as a 2D read at (x &amp; 0x3FFF, x &gt;&gt; 14),
+        /// because the texture type query did not say it is a texture buffer.
+        /// </summary>
+        /// <param name="handle">Texture handle</param>
+        void RecordTexelFetch1D(int handle)
+        {
+        }
+
+        /// <summary>
         /// Gets the size in bytes of a bound constant buffer for the current shader stage.
         /// </summary>
         /// <param name="slot">The number of the constant buffer to get the size from</param>

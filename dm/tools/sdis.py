@@ -78,7 +78,9 @@ if sys.argv[2] == '--sym':      # sdis.py <image> --sym 0xoffset...  give the co
     sys.exit()
 if sys.argv[2] == '--xref':     # sdis.py <image> --xref 0xaddr...  find the instructions that build this address with adrp+add/ldr
     want = {int(a, 16) for a in sys.argv[3:]}
-    textend = max(v + s for v, s in defs.values() if v < 0x10000000 and s)
+    textend = max((v + s for v, s in defs.values() if v < 0x10000000 and s), default=0)
+    if not plt: plt_scan()
+    if plt: textend = max(textend, max(plt) + 16)   # the PLT ends the text segment (a main exports too few symbols to bound it)
     for o in range(0, min(len(img), textend), 4):
         w = struct.unpack_from('<I', img, o)[0]
         if w & 0x9F000000 != 0x90000000: continue
@@ -103,7 +105,7 @@ if sys.argv[2] == '--find':
         if sys.argv[3] in n: print(f'{v:#x} {sz:#x} {n}')
     sys.exit()
 if sys.argv[2] == '--callers':
-    tgt = resolve(sys.argv[3]); textend = max(v + s for v, s in defs.values() if v < 0x10000000 and s)  # Coarse upper bound
+    tgt = resolve(sys.argv[3]); textend = max((v + s for v, s in defs.values() if v < 0x10000000 and s), default=0)  # Coarse upper bound
     if not plt: plt_scan()
     if plt: textend = max(textend, max(plt) + 16)   # the PLT ends the text segment (a main exports too few symbols to bound it)
     for o in range(0, min(len(img), textend), 4):

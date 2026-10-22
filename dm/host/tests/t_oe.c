@@ -17,7 +17,7 @@ void hle_signal_system_event(void *g) { (void)g; ev_sig = 1; }
 void hle_clear_system_event(void *g) { (void)g; ev_sig = 0; }
 static int checks, fails;
 #define CHECK(c, s) do { checks++; int ok = !!(c); fails += !ok; printf("%s %s\n", ok ? "✓" : "✗", s); } while (0)
-static void reset(void) { g_mqh = g_mqn = 0; g_focus = 1; g_opmode = 1; g_ntf_opmode = g_ntf_perfmode = 0; }
+static void reset(void) { g_mqh = g_mqn = 0; g_focus = 1; g_opmode = 1; g_ntf_opmode = g_ntf_perfmode = 0; g_focus_mode = -1; }
 static int pop_is(uint32_t want) { uint32_t m = 999; return h_oe_TryPopMsg(&m) && m == want; }
 static int empty(void) { uint32_t m = 999; return !h_oe_TryPopMsg(&m) && m == 999; }
 static int child_kind;
@@ -110,5 +110,17 @@ int main(void) {
     CHECK(pop_is(30) && ev_sig && pop_is(31) && !ev_sig, "notification event: cleared only when the queue is empty");
     ev_sig = 1;
     CHECK(empty() && !ev_sig, "notification event: a pop from an empty queue clears a signal left behind");
+    // Focus handling modes 0 and 3 get no focus notifications (the system suspends the game instead); 1 and 2 do. Super Mario Galaxy 2 sets 3 and deadlocked in its own pause on focus 2
+    reset(); g_ntf_opmode = g_ntf_perfmode = 1; h_oe_SetFocusMode(3);
+    dm_focus_set(2); dm_focus_set(3);
+    CHECK(empty() && h_oe_GetFocus() == 3, "focus mode 3: focus changes queue nothing, the state is still queried as 3");
+    dm_set_opmode(0); dm_focus_set(1);
+    CHECK(pop_is(30) && pop_is(31) && empty() && h_oe_GetFocus() == 1, "focus mode 3: mode notifications still queued, no 15");
+    h_oe_SetFocusMode(0); dm_focus_set(2);
+    CHECK(empty(), "focus mode 0: no focus notification");
+    h_oe_SetFocusMode(2); dm_focus_set(1);
+    CHECK(pop_is(15) && empty(), "focus mode 2: focus notification 15");
+    h_oe_SetFocusMode(1); dm_focus_set(2);
+    CHECK(pop_is(15) && empty(), "focus mode 1: focus notification 15");
     printf("== oe %d checks, %d failed ==\n", checks, fails); return fails != 0;
 }

@@ -46,10 +46,10 @@ def area(s):
     return 'C / libc'
 
 def host_hooks(host, forced=True):
-    """The names the host resolves imports to: HLE / HLE_FORCE hooks in dm/host/*.c, the libc passthrough table (hle_table.c L), the Vulkan layer (VK / VKB in dm/gfx/vk/*.m).
+    """The names the host resolves imports to: HLE / HLE_FORCE hooks in dm/host/*.c and dm/gfx's (nn::vi, nv::, NVN), the libc passthrough table (hle_table.c L), the Vulkan layer (VK / VKB in dm/gfx/vk/*.m).
     forced=False leaves out the HLE_FORCE hooks: some wrap the module's own function (glslcCompile), so the module that defines it is still needed"""
     hooks = set()
-    for f in glob.glob(os.path.join(host, '*.c')):
+    for f in glob.glob(os.path.join(host, '*.c')) + glob.glob(os.path.join(host, '../gfx/*.c')) + glob.glob(os.path.join(host, '../gfx/nvn/*.c')):
         t = open(f, encoding='utf-8', errors='replace').read()
         hooks |= set(re.findall(r'\bHLE\(\s*"([^"]+)"', t))
         if forced: hooks |= set(re.findall(r'\bHLE_FORCE(?:_BIG)?\(\s*"([^"]+)"', t))
