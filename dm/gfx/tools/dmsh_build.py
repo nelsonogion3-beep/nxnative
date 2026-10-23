@@ -7,6 +7,7 @@
 # Environment IOSOUT=dir: the same MSL also goes through dm/ios/tools/ios_metal.compile to produce an iphoneos metallib + reflection (chain_metal records the iOS compile convention)
 # Final summary: success / failure counts and the distribution of reasons; distribution of driver segment read offsets (those outside the range the replay layer can fill are listed separately)
 import ast, inspect, os, re, sys, json, struct, hashlib, shutil, subprocess, tempfile, collections, threading, concurrent.futures as cf
+import dmsh_geometry
 DM_ROOT = os.environ.get('DM_ROOT') or os.path.expanduser('~/dm-work')   # Workspace root (game files, build outputs and run artifacts are all under it)
 HOME = os.path.expanduser('~')
 dm_dir, out = sys.argv[1:3]; want = set(sys.argv[3:]); cache_root = out
@@ -27,7 +28,11 @@ MAP = str(GAME.table('shader_map.tsv'))
 BF_WANT_FILE = str(GAME.table('bf_want.tsv'))
 BF_WANT = {line.strip() for line in open(BF_WANT_FILE) if line.strip() and not line.lstrip().startswith('#')} if os.path.exists(BF_WANT_FILE) else set()
 XC = ['--msl', '--msl-version', '20300', '--msl-argument-buffers', '--msl-texture-buffer-native', '--msl-pad-fragment-output']
-CAS = os.environ.get('DMSH_CAS', os.path.join(cache_root, 'cas'))
+# spirv-cross writes the translator's FMin / FMax / FClamp as fast::min / max / clamp, whose result for a NaN operand is the GPU's choice; Maxwell's FMNMX returns the other operand
+# and its saturation gives 0, as Metal's precise:: functions (IEEE fmin / fmax) do on every GPU. The M4 Pro's fast ones happen to agree, an A20 Pro's do not: Super Mario Galaxy 2's
+# GX lighting takes max(0, NaN) from light directions left at zero, and the half of Mario its fill light faces came out white on the iPhone (GitHub issue 72; vk_shaders.py PRECISE)
+def precise(msl): return re.sub(r'\bfast::(min|max|clamp)\(', r'precise::\1(', msl)
+CAS =os.environ.get('DMSH_CAS', os.path.join(cache_root, 'cas'))
 CAS_LOCKS, CAS_LOCKS_GUARD = {}, threading.Lock()
 PRE_STATS = collections.Counter()
 # -fpreserve-invariance: vertex positions are marked [[invariant]], but without this flag Metal does not promise that two different shaders compute the same expression to the same value; on Maxwell the same multiply-adds always agree.
@@ -39,7 +44,9 @@ def mac_compile(msl, air, lib):   # same interface as ios_metal.compile
     subprocess.run(['xcrun', '-sdk', 'macosx', 'metallib', air, '-o', lib], check=True)
 # The NVN driver's constant segments have one layout in every game (NVN 53 and 55 drivers, SDK 6 to 21: the handles of every shader of every profile fit it); nvn_mtl.m fills them the same way at run time.
 #   c2 0x20 + 8 r: handles bound with nvnCommandBufferBindTexture (combined texture and sampler), slot r. The driver has 32 such slots, but a game may bind higher ones, whose words lie in the
-#     image table (Hades II binds slot 34, at 0x130, and no image), so a texture instruction's handle anywhere below the separate texture table names a combined slot
+#     image table (Hades II binds slot 34, at 0x130, and no image), so a texture instruction's handle anywhere below the separate texture table names a combined slot. In the image
+#     table that slot reads the image when one is bound there (nvn_mtl.m tex_slot_h): a size query of the image a compute shader writes (Unreal's GetDimensions on a RWTexture3D),
+#     whose type the translator takes from the shader's surface instructions on that handle (dmsh_xlate ImageDims)
 #   c2 0x120 + 8 r: images (nvnCommandBufferBindImage), slot r < 8
 #   c2 0x168 + 8 r: separate textures (nvnCommandBufferBindSeparateTexture), reported as slot 128 + r, where the host binds them (hle_nvn.c, NVN_SEPTEX_SLOT0); Unity, Unreal and RE Engine bind these
 #   c2 0x568 + 8 r: separate samplers (nvnCommandBufferBindSeparateSampler), slot r < 128
@@ -104,6 +111,7 @@ def cache_outputs(key, digest, cached=False):
             ('ios', IOSOUT, [key + '_b.metallib', key + '_b.json'])):
         if not directory: continue
         base = os.path.join(root, label) if cached else directory
+        names += [key + s + ext for s in ('_bg0', '_bg1', '_bg2', '_bg3', '_bg4', '_bgv') for ext in ('.metallib', '.json', '.metal') if label == 'mac' or ext != '.metal']
         found = [n for n in names if os.path.exists(os.path.join(base, n))]
         if key + '_b.metallib' not in found or key + '_b.json' not in found: return None
         files[label] = found
@@ -269,10 +277,39 @@ for ln in open(MAP + '.conflicts.tsv'):
     c = ln.rstrip('\n').split('\t')
     if len(c) > 1 and not ln.startswith('#') and not ln.startswith('dm_') and c[0] in pc_of: pc_of[c[0]] = c[1]
 
+def vertex_ab(key, code, ctl):
+    """A vertex shader in two parts, VertexA + VertexB, as one program (Catherine: Full Body's GLSLC, SDK 8.2.1, GPU code version 1.15, writes every vertex shader so; the other games' are one
+    program of shader type 1). Part A sits at code +0, its SPH with shader type 0 (Maxwell's VERTEX_CULL_BEFORE_FETCH slot): it loads the position attribute and writes only the position.
+    Part B starts at control +0x700 (its own 0x30-byte header, then an SPH of shader type 1) and writes the other outputs from the other attributes. The hardware runs A, then B; translated
+    alone, A left every varying unwritten (a full-screen pass read its texture coordinate as 0 and the whole screen came out one texel's colour). Control +0x748 lists both parts as
+    {SPH offset, length from the SPH, ?} for A, then for B. The merge is what Ryujinx's TranslatorContext.Translate(VertexA) builds: A's instructions, each unconditional EXIT a branch to
+    B's first instruction, then B's, under B's SPH with A's flags and input / output maps ORed in and the larger local memory sizes. Measured on all 1,244 of the game's vertex shaders: A
+    writes no generic output (so none of B's loads reads one of A's), A ends in two EXITs (one predicated on CC FCSM_TR, which Ryujinx never takes, left as it is) and a BRA to itself,
+    and neither part has an absolute or table jump, so moving B keeps every branch. → (code area with its 0x30 header, c1), c1 being what follows part B; None for any other vertex shader"""
+    if len(code) < 0x80 or len(ctl) < 0x760 or code[:4] != bytes.fromhex('78563412'): return None
+    w0 = struct.unpack_from('<I', code, 0x30)[0]
+    if w0 & 0x1f != 1 or (w0 >> 10) & 0xf != 0: return None
+    a_sph, a_len, _, b_sph, b_len, _ = struct.unpack_from('<6I', ctl, 0x748)
+    if not any((a_sph, a_len, b_sph, b_len)): return None   # one program of shader type 0, no part B: translated as it is (Ryujinx reads type 0 as a vertex shader)
+    bw0 =struct.unpack_from('<I', code, b_sph)[0] if 0x80 <= b_sph <= len(code) - 0x50 else 0
+    if a_sph != 0x30 or b_sph != struct.unpack_from('<I', ctl, 0x700)[0] + 0x30 or bw0 & 0x1f != 1 or (bw0 >> 10) & 0xf != 1 or (a_len - 0x50) % 32 or (b_len - 0x50) % 32 or b_sph + b_len > len(code):
+        sys.exit(f'[RED] {key}: vertex shader of shader type 0 without a VertexB part in the expected place (control +0x748 {a_sph:#x} {a_len:#x} {b_sph:#x} {b_len:#x})')
+    sa, sb = list(struct.unpack_from('<20I', code, a_sph)), list(struct.unpack_from('<20I', code, b_sph))
+    sph = [sb[0] | sa[0] & ~(0xf << 10)] + [max(sa[i] & 0xffffff, sb[i] & 0xffffff) | sb[i] & ~0xffffff for i in (1, 2, 3)] + [sb[4]] + [sa[i] | sb[i] for i in range(5, 20)]
+    a = bytearray(code[a_sph + 0x50:a_sph + a_len]); b = code[b_sph + 0x50:b_sph + b_len]
+    for o in range(0, len(a), 8):
+        if o % 32 == 0: continue   # the scheduling word of each group of three instructions
+        ins = struct.unpack_from('<Q', a, o)[0]
+        if ins >> 52 == 0xe30 and ins & 0x1f == 0xf:   # EXIT with CC T (any predicate) → BRA to part B, keeping the predicate and CC bits; the offset counts from the next instruction
+            struct.pack_into('<Q', a, o, 0xe24 << 52 | ((len(a) - (o + 8)) & 0xffffff) << 20 | ins & 0xfffff)
+    return code[:0x30] + struct.pack('<20I', *sph) + bytes(a) + b, code[b_sph + b_len:]
+
 def job_for(key, name, rec, w):
     ci = rec.find(bytes.fromhex('34127698')); code = rec[0x38:ci]; stage = name[:2]
     c1o, c1t = struct.unpack_from('<2I', rec, ci + 0x700)   # control segment +0x700: c1 relative to the start of the instruction area, +0x704: total length of the instruction area (c1 = what lies between the two; lengths across the whole library are 0 / 256 / 512 / 768)
     c1 = rec[0x38 + c1o:0x38 + c1t]
+    ab = vertex_ab(key, code, rec[ci:]) if stage == 'vs' else None
+    if ab: code, c1 = ab
     if stage != 'cs': code = code[0x30:]   # strip the 0x30 header (the 0x50 SPH after it is read by the translator itself)
     elif code[:4] == bytes.fromhex('79563412'):
         # Compute in this game has a header (magic 0x12345679; D2R's package records have none): 0x30 header + zero padding, instructions start at code area +0x100 (measured on all 71; the BRA-to-self and the control words are 32-byte aligned to this start).
@@ -399,6 +436,15 @@ def decode_ubo_tex(name):
     if not 3 <= tb <= 16 or ty not in (0, 1, 3) or (ty == 1 and not 3 <= sb <= 16): return None
     return (tb - 3, o0 * 4), (('id', o1) if ty == 3 else (sb - 3, o1 * 4) if ty else (tb - 3, o0 * 4))
 
+def c2_array(name, ty):
+    """An array of combined handles in the driver table c2 that the shader indexes at run time (Ryujinx's texture array from a buffer, here bank 2: <stage>_t<type>_cb2_<handle>, declared
+    array<element, n>; the index is the handle's byte offset ÷ 8). Luigi's Mansion 3: 586 pixel shaders sample their shadow cascades from array<texture2d_array<float>, 32> fp_t2das_cb2_0,
+    the index (0x80 + a cascade offset) ÷ 8. → the c2 byte offset of element 0 (element k = the handle at that offset + 8k), or None"""
+    m = re.fullmatch(r'[a-z]+_t\w*?_cb2_([0-9A-F]+)', name[:-5] if name.endswith('Smplr') else name)
+    if not m or not ty.startswith('array<'): return None
+    h = int(m.group(1), 16)
+    return (h & 0x3fff) * 4 if h >> 28 == 0 else None
+
 def reflect(key, stage, msl, res):
     """MSL argument buffer struct member → replay reflection: kind (same as nvn_refl.h) + NVN slot number + argument buffer member index"""
     body = re.search(r'struct spvDescriptorSetBuffer0\s*\{(.*?)\};', msl, re.S)
@@ -407,7 +453,8 @@ def reflect(key, stage, msl, res):
     for m in re.finditer(r'^\s*(.+?)\s+(\w+)\s*\[\[id\((\d+)\)\]\];', body.group(1) if body else '', re.M):
         ty, nm, aid = m.group(1).strip(), m.group(2), int(m.group(3))
         e = {'msl_name': nm, 'msl_type': ty, 'arg_id': aid}
-        if nm == 'support_buffer': e.update(kind='support')
+        if nm in dmsh_geometry.HELPERS: e.update(kind='geometry', reg=dmsh_geometry.HELPERS[nm])
+        elif nm == 'support_buffer': e.update(kind='support')
         elif re.fullmatch(r'[a-z]+_c(\d+)', nm):
             n = int(re.fullmatch(r'[a-z]+_c(\d+)', nm).group(1))
             e.update(kind='cbuf', reg=n - 3) if 3 <= n <= 16 else e.update(kind='c1' if n == 1 else 'drvcb', bank=n)
@@ -418,6 +465,8 @@ def reflect(key, stage, msl, res):
             if nm.endswith('Smplr'): e.update(kind='samp_id', reg=us[1]) if us[0] == 'id' else e.update(kind='samp_ubo', reg=us[0], off=us[1])
             elif 'texture_buffer' in ty: e.update(kind='?')   # bindless typed buffer: not implemented in the replay layer
             else: e.update(kind='tex_ubo', reg=ut[0], off=ut[1])
+        elif c2_array(nm, ty) is not None:   # an array of the driver table's handles (c2_array): the replay fills element k from the slot whose c2 word is at off + 8k
+            e.update(kind='samp_c2a' if nm.endswith('Smplr') else 'tex_c2a', off=c2_array(nm, ty))
         elif nm.endswith('Smplr'):   # handle type 0 = texture and sampler combined in one handle: the sampler index is taken from the high bits of that texture slot's handle
             t, s, ty = decode_tex(nm[:-5]); e.update(kind='samp_id', reg=const_sampler(nm[:-5])) if ty == 3 else e.update(kind='samp', reg=s) if ty else e.update(kind='samp_tex', reg=t)
         else:
@@ -470,7 +519,7 @@ def unfillable(dr):
 
 RULES = []   # MSL rewrite rules attached by shader name (function, applicability test); the former dark-range remap toe has been removed (back to the original Switch brightness)
 # The first-stage code fingerprint does not include dmsh_fetch.py; readable-tile variants get a separate second-stage cache keyed on the generated MSL.
-CODE_FP = hashlib.sha256(source_without_rule_bodies().encode() + b''.join(b'\0' + open(m.__file__, 'rb').read() for m in (dmsh_chain,) + ((ios_metal,) if IOSOUT else ()))).hexdigest()
+CODE_FP = hashlib.sha256(source_without_rule_bodies().encode() + b''.join(b'\0' + open(m.__file__, 'rb').read() for m in (dmsh_chain, dmsh_geometry) + ((ios_metal,) if IOSOUT else ()))).hexdigest()
 TOOL_FP = tool_fingerprint().encode()
 
 _CAST = ('as_type<int>(', 'as_type<uint>(')
@@ -611,6 +660,27 @@ def vs_depth(src):
     single = src[:m.start()] + gl
     return single, single + '\n' + re.sub(r'\bmain0\s*\(', 'main0_z(', body, count=1)
 
+def fs_uint(src):
+    """Integer colour targets. With no PC version the translator declares every fragment output float; a shader writes an integer as the float with its bits (as_type<float>(…)), and Metal
+    refuses a pipeline whose float output meets an integer attachment. Luigi's Mansion 3 draws its whole scene into an R32Uint + RGBA8Uint G-buffer (1,377 of its 4,307 pixel shaders write
+    an output from integer bits): a hand-written row per shader (shader_facts_manual.tsv) does not scale to that. A pixel shader that writes an output from integer bits gets a second entry
+    point, main0_u, the same body returning every colour output as the unsigned integer vector of the same bits (as_type, nothing converted); the host takes it for a pipeline whose colour
+    attachments are all unsigned integer formats (nvn_mtl.m). → the source with main0_u added, or None"""
+    m = re.search(r'^.*\bfragment\s+main0_out\s+main0\s*\(', src, re.M); st = re.search(r'struct main0_out\s*\{(.*?)\};', src, re.S)
+    if not m or not st: return None
+    mem = re.findall(r'^\s*(\w+)\s+(\w+)\s*(\[\[[^\]]*\]\])?;', st.group(1), re.M)
+    cols = {nm: ty for ty, nm, at in mem if 'color(' in at and ty.startswith('float')}
+    # The hardware writes an output's bits to an integer target whatever the shader computed, so main0_u is right for any pixel shader; only those that look like integer writers get one
+    # (the library stays small): an output from integer bits, or nothing but constants (a clear drawn into an integer target, 35e1865e313f0553 writes 0 into Luigi's Mansion 3's R32Uint target)
+    ints = any(re.search(r'\bout\.%s(?:\.\w+)? = as_type<float\d?>\(' % nm, src) for nm in cols)
+    writes = [m.group(1) for nm in cols for m in re.finditer(r'\bout\.%s(?:\.\w+)? = ([^;]+);' % nm, src)]
+    if not ints and not (writes and all(re.fullmatch(r'-?[0-9.]+f?|float\d\([-0-9., ]*\)', w.strip()) for w in writes)): return None
+    uty = lambda ty: 'u' + ty.replace('float', 'int')   # float4 → uint4, float → uint
+    struct = 'struct main0_out_u\n{\n' + ''.join(f'    {uty(cols[nm]) if nm in cols else ty} {nm} {at};\n' for ty, nm, at in mem) + '};\n\n'
+    ret = 'return main0_out_u{' + ', '.join(f'as_type<{uty(cols[nm])}>(out.{nm})' if nm in cols else f'out.{nm}' for _, nm, _ in mem) + '};'
+    body = re.sub(r'\bfragment\s+main0_out\s+main0\s*\(', 'fragment main0_out_u main0_u(', src[m.start():], count=1).replace('return out;', ret)
+    return src + '\n' + struct + body
+
 SG_OPS = {333: 'true', 334: 'pred', 335: 'pred', 336: 'true', 337: 'value', 338: 'value', 339: 'ballot', 345: 'value', 346: 'value', 347: 'value', 348: 'value'}   # OpGroupNonUniform* → its one-lane value
 SG_BUILTINS = {36: 'one', 41: 'zero', 4416: 'one4', 4417: 'one4', 4418: 'zero4', 4419: 'one4', 4420: 'zero4'}   # SubgroupSize, SubgroupLocalInvocationId, Eq / Ge / Gt / Le / Lt masks
 def spv_single_lane(path):
@@ -660,16 +730,71 @@ def _ep_drop(x, ids):   # OpEntryPoint without the given interface IDs: model, f
     y[0] = len(y) << 16 | (x[0] & 0xffff)
     return y
 
+def geometry_finish(key, w, j, c1):
+    """Build all five input-topology variants; the draw selects one at replay.
+    Resources retain logical NVN stage 2 even though Metal executes a kernel.
+    """
+    code = open(j['code'], 'rb').read()
+    w2, w3, w4 = struct.unpack_from('<3I', code, 8)
+    nv, inv, topology = w4 & 4095, w2 >> 24, w3 >> 24 & 15
+    if topology not in (1, 6, 7) or not nv or not inv:
+        return 'geometry failed', 'invalid output declaration', None
+    nidx = nv * 2  # one restart after every emitted vertex, including incomplete strips
+    jobs = [{**j, 'key': key + '_g' + str(t), 'geometry_topology': t} for t in range(5)]
+    jp = os.path.join(w, key + '_geometry.json'); atomic_json(jp, jobs)
+    rx = subprocess.run([XLATE, jp, w], capture_output=True, text=True)
+    if rx.returncode: return 'geometry failed', rx.stderr.strip()[:160], None
+    base = None
+    for t, job in enumerate(jobs):
+        k = job['key']; spv = os.path.join(w, k + '.spv')
+        dmsh_geometry.flatten_sets(spv)
+        r = subprocess.run(['spirv-cross', *XC, spv], capture_output=True, text=True)
+        if r.returncode: return 'geometry MSL failed', r.stderr.strip()[:160], None
+        src = dmsh_geometry.topology_pointer(precise(r.stdout))
+        res = json.load(open(os.path.join(w, k + '.res.json')))
+        refl = {'key': key + '_bg' + str(t), 'route': 'B', 'chain': CHAIN, 'dm_ctl': key,
+                'source': f'{loc[key][0]}#{loc[key][1]}', 'pc_paired': pc_of[key], 'stage': 'gs',
+                'entry': 'main0', 'msl_entry_kind': 'kernel', 'threadgroup_size': [32, 1, 1],
+                'geometry': {'vertices': nv, 'invocations': inv, 'output': topology,
+                             'stride': res['geometry_stride'], 'index_stride': nidx},
+                'c1': c1.hex(), 'notes': res['notes'], 'drv_reads': drv_reads(src), 'drv_unfillable': [],
+                'bindings': reflect(key, 'gs', src, res), 'vertex_inputs': [], 'raster': {}}
+        def save(suffix, text, meta):
+            path = os.path.join(out, key + suffix + '.metal'); open(path, 'w').write(text)
+            MTL.compile('mac', path, os.path.join(out, key + suffix + '.metallib'))
+            atomic_json(os.path.join(out, key + suffix + '.json'), dict(meta, chain_metal=MAC_RECORD))
+            if IOSOUT:
+                MTL.compile('ios', path, os.path.join(IOSOUT, key + suffix + '.metallib'))
+                atomic_json(os.path.join(IOSOUT, key + suffix + '.json'), dict(meta, chain_metal=ios_metal.RECORD))
+        save('_bg' + str(t), src, refl)
+        if t == 0:
+            base = {**refl, 'key': key + '_b'}
+            save('_b', src, base)
+            spv = os.path.join(w, k + '.reader.spv'); dmsh_geometry.flatten_sets(spv)
+            r = subprocess.run(['spirv-cross', *XC, spv], capture_output=True, text=True)
+            if r.returncode: return 'geometry reader failed', r.stderr.strip()[:160], None
+            reader = vs_layer(vs_init(precise(r.stdout)))
+            analysis, full = vs_depth(reader)
+            meta = {'key': key + '_bgv', 'route': 'B', 'chain': CHAIN, 'dm_ctl': key,
+                    'stage': 'vs', 'entry': 'main0', 'entry_z': 'main0_z', 'msl_entry_kind': 'vertex',
+                    'geometry_reader': True, 'geometry_output': topology, 'c1': '', 'notes': [], 'drv_reads': {}, 'drv_unfillable': [],
+                    'bindings': reflect(key, 'vs', analysis, {'sbufs': []}), 'vertex_inputs': [], 'raster': {}}
+            save('_bgv', full, meta)
+    return 'ok', '', base
+
+
 def finish(key, w, j, c1):
     name, k = loc[key]
     msl = os.path.join(w, key + '.metal'); lib = os.path.join(out, key + '_b.metallib')
-    if j['stage'] == 'gs':   # a geometry shader that only picks the layer is folded into the vertex shader by the host (see gs_slice); any other has no Metal counterpart and fails below
+    if j['stage'] == 'gs':   # keep the layer-only fold; other geometry runs as compute
         s = gs_slice(os.path.join(w, key + '.spv'))
         if s:
             refl = {'key': key + '_b', 'route': 'B', 'chain': CHAIN, 'dm_ctl': key, 'source': f'{name}#{k}', 'pc_paired': pc_of[key], 'stage': 'gs', 'gs_slice': s,
                     'notes': [], 'drv_reads': '', 'drv_unfillable': [], 'bindings': []}   # no library: the host draws with the vertex shader's layer entry points
             write_refl(key, refl)
             return 'ok', '', refl
+        try: return geometry_finish(key, w, j, c1)
+        except (ValueError, subprocess.CalledProcessError) as e: return 'geometry failed', str(e)[:160], None
     if j['stage'] == 'vs': spv_single_lane(os.path.join(w, key + '.spv'))   # one-lane subgroups (see spv_single_lane)
     r = subprocess.run(['spirv-cross', *XC, os.path.join(w, key + '.spv'), '--output', msl], capture_output=True, text=True)
     if r.returncode: return 'MSL failed', r.stderr.strip()[:160], None
@@ -684,6 +809,7 @@ def finish(key, w, j, c1):
             r = subprocess.run(['spirv-cross', *XC, os.path.join(w, key + '.spv'), '--output', msl], capture_output=True, text=True)
             if r.returncode: return 'MSL failed', r.stderr.strip()[:160], None
             src = open(msl).read()
+    src = precise(src); open(msl, 'w').write(src)   # min / max / clamp with Maxwell's NaN results (see precise)
     pad = []
     if j['stage'] == 'vs':   # outputs start as (0,0,0,1) (see vs_init); no point size beside a layer output (see vs_layer)
         src = vs_layer(vs_init(src)); open(msl, 'w').write(src)
@@ -692,16 +818,20 @@ def finish(key, w, j, c1):
         if pad: open(msl, 'w').write(src)
     lay = None
     if j['stage'] == 'vs':   # the two depth-convention entry points (see vs_depth); the analysis below uses the source with only main0
+        capture = dmsh_geometry.capture(src)
         src, full = vs_depth(src)
+        full += capture
         if j.get('tf'): full += vs_tf(src, j['tf'])   # transform feedback capture (see vs_tf)
         plain = full
         full, lay = vs_layer_entry(full)   # layer entry points for a slice-writing geometry shader (see vs_layer_entry)
         open(msl, 'w').write(full)
+    fu = fs_uint(src) if j['stage'] == 'ps' else None   # the integer-output entry point (see fs_uint); the analysis below uses the source with only main0
+    if fu: plain = src; open(msl, 'w').write(fu)
     res = json.load(open(os.path.join(w, key + '.res.json')))
     try: MTL.compile('mac', msl, lib)   # MSL identical to one compiled before takes that library (dmsh_mtlcache.py)
     except subprocess.CalledProcessError as e:
-        if not lay: return 'metal failed', str(e)[:160], None
-        open(msl, 'w').write(plain); lay = None   # the layer entry points are an extra: a library that does not build with them is built without
+        if not lay and not fu: return 'metal failed', str(e)[:160], None
+        open(msl, 'w').write(plain); lay = fu = None   # the layer and integer-output entry points are extras: a library that does not build with them is built without
         try: MTL.compile('mac', msl, lib)
         except subprocess.CalledProcessError as e: return 'metal failed', str(e)[:160], None
     clone(msl, os.path.join(out, key + '_b.metal'))
@@ -711,9 +841,9 @@ def finish(key, w, j, c1):
     entry = re.search(r'(vertex|fragment|kernel)\s+\S+\s+(\w+)\s*\(', src)
     dr = drv_reads(src)
     refl = {'key': key + '_b', 'route': 'B', 'chain': CHAIN, 'dm_ctl': key, 'source': f'{name}#{k}', 'pc_paired': pc_of[key], 'stage': j['stage'],
-            'entry': entry.group(2) if entry else 'main0', 'msl_entry_kind': entry.group(1) if entry else None, **({'entry_z': 'main0_z'} if j['stage'] == 'vs' else {}),
+            'entry': entry.group(2) if entry else 'main0', 'msl_entry_kind': entry.group(1) if entry else None, **({'entry_z': 'main0_z', 'entry_geometry_capture': 'main0_gs'} if j['stage'] == 'vs' else {}),
             **({'entry_tf': 'main0_tf', 'tf_strides': [e[2] if e else 0 for e in j['tf']]} if j.get('tf') else {}),
-            **({'entry_layer': 'main0_l', 'entry_layer_z': 'main0_lz', 'layer_from': lay} if lay else {}),
+            **({'entry_layer': 'main0_l', 'entry_layer_z': 'main0_lz', 'layer_from': lay} if lay else {}), **({'entry_u': 'main0_u'} if fu else {}),
             'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['not in the answer table, queries use defaults'] if j.get('no_facts') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr),
             'bindings': reflect(key, j['stage'], src, res),
             'vertex_inputs': [{'location': int(m.group(2)), 'msl_type': m.group(1)} for m in re.finditer(r'(\w+)\s+\w+\s*\[\[attribute\((\d+)\)\]\]', src)],

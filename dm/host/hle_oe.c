@@ -91,6 +91,9 @@ HLE_FORCE("_ZN2nn2oe14ExecuteProgramEiPKvm", "launch another program of the appl
     (void)param; LOG("[RED] oe::ExecuteProgram(%d, %zu bytes of parameters): the host runs only this program; the game carries on", index, n);
 }
 HLE_FORCE("_ZN2nn2oe16DisableRecordingEv", "video recording switch; the host has no system recording", void, h_oe_DisableRec, void) {}
+// Silence the game's sound in system video captures (through am; FINAL FANTASY RESONANCE imports both): the host records nothing
+HLE_FORCE("_ZN2nn2oe13MuteRecordingEv", "mute the sound of system video recording; the host has no system recording", void, h_oe_MuteRec, void) {}
+HLE_FORCE("_ZN2nn2oe15UnmuteRecordingEv", "unmute the sound of system video recording; the host has no system recording", void, h_oe_UnmuteRec, void) {}
 HLE_FORCE("_ZN2nn2oe16EnableScreenShotEv", "screenshot switch; the host has no system screenshot", void, h_oe_EnableShot, void) {}
 HLE_FORCE("_ZN2nn2oe17DisableScreenShotEv", "screenshot switch; the host has no system screenshot", void, h_oe_DisableShot, void) {}
 // Super Mario Odyssey: HOME button blocking around its own menus, screenshot orientation, and the auto-sleep query (all through am)
@@ -208,6 +211,15 @@ HLE_FORCE("_ZN2nn2oe18GetDesiredLanguageEv", "system language query; value from 
     strncpy(code, e && *e ? e : "en-US", sizeof code - 1);
     uint64_t v; memcpy(&v, code, 8);
     return v;
+}
+
+// The console's region (Animal Crossing: New Horizons 3.0.3): the SDK asks settings::system::GetRegionCode, which reaches set:sys. A region that fits the language the game is given:
+// 0 Japan, 1 the Americas, 2 Europe, 4 Hong Kong / Taiwan / Korea (nn::settings::system::RegionCode; 3 Australia and 5 China are left out, no language points at them alone)
+HLE_FORCE("_ZN2nn2oe13GetRegionCodeEv", "console region (set:sys); from DM_LANG", int, h_oe_GetRegion, void) {
+    const char *e = getenv("DM_LANG"); if (!e || !*e) e = "en-US";
+    int r = !strncmp(e, "ja", 2) ? 0 : !strncmp(e, "ko", 2) || !strncmp(e, "zh", 2) ? 4 : !strcmp(e, "en-US") || !strcmp(e, "fr-CA") || !strcmp(e, "es-419") || !strcmp(e, "pt-BR") ? 1 : 2;
+    static int once; if (!once++) LOG("oe::GetRegionCode: %d for language %s", r, e);
+    return r;
 }
 
 // nn::util::Uuid 16 bytes: a fixed local value (only used to tell devices apart locally, networking is cut)

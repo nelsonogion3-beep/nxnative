@@ -89,8 +89,11 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
         strlcpy(g_mnt[g_nmnt].overlay, getenv("DM_ROMFS_OVERLAY"), sizeof g_mnt[0].overlay);
     // The transaction directory cannot be set up (leftovers cannot be cleared / clone failed, which really happens on a full disk): do not exit; mount the committed directory read-only -- saves still read, every write fails, commits are no-ops, the committed version is untouched, and the front end is told
     // (each of these three failures used to call die: with the phone's storage full the game exited as soon as it mounted its saves)
-    int txn_err = 0;
-    if (txn) {
+    int txn_err = 0, k = 0;
+    while (txn && k < g_nmnt && strcmp(g_mnt[k].commit, dir)) k++;
+    if (txn && k < g_nmnt) {   // a second name for a save already mounted (account and device save data are one host save): it shares that transaction, whose pending writes a new clone would drop
+        strlcpy(g_mnt[g_nmnt].commit, g_mnt[k].commit, sizeof g_mnt[0].commit); strlcpy(g_mnt[g_nmnt].dir, g_mnt[k].dir, sizeof g_mnt[0].dir);
+    } else if (txn) {
         char work[1100], neu[1100]; snprintf(work, sizeof work, "%s.work", dir); snprintf(neu, sizeof neu, "%s.new", dir);
         mkdir(dir, 0755);
         const char *why = NULL;
@@ -319,14 +322,69 @@ HLE_FORCE("_ZN2nn2fs8MountRomEPKcPvm", "fsp-srv; rom → host RomFS directory", 
 // Add-on content (DLC) RomFS: DM_AOC_DIR/<index>/, extracted from the player's DLC NSPs by the packing script; mounted read-only, using the directory index like rom.
 // The owned index list is reported by the aoc calls in hle_misc.c from the same directory; the game only mounts indices it was given, and a missing directory answers "target not found" (fs 2-1002, as on hardware without that DLC)
 #define RES_TARGET_NOT_FOUND 0x7D402u   // fs module 2, description 1002
-HLE_FORCE("_ZN2nn2fs31QueryMountAddOnContentCacheSizeEPmi", "fsp-srv; add-on content reads the host directory directly, the cache gets only the minimum size", Result, h_fs_QueryAocCache, size_t *out, int index) { (void)index; *out = 0x1000; return RES_OK; }
+// The cache a Query…CacheSize asks for is, on Horizon, the RomFS's file table as RomFsFileSystem::GetRequiredWorkingMemorySize sizes it: the directory and file hash tables (4 bytes a bucket)
+// and entries (0x18 / 0x20 bytes plus the name, padded to 4). The host reads the files directly and needs no cache, but games take it from heaps sized for the real answer:
+// Mario Kart 8 Deluxe mounts its add-on content (two files) with a cache from its 0x3130-byte AocHeap, and with a 4 KB answer the decryption buffer that follows came back null (main+0x87376c).
+static size_t romfs_buckets(size_t n) {   // the hash table size of the RomFS builder: 3 below 3 entries, odd below 19, else the next number with no prime factor up to 17
+    if (n < 3) return 3;
+    if (n < 19) return n | 1;
+    while (!(n % 2 && n % 3 && n % 5 && n % 7 && n % 11 && n % 13 && n % 17)) n++;
+    return n;
+}
+static void romfs_tables(const char *dir, size_t *ndir, size_t *dbytes, size_t *nfile, size_t *fbytes, int depth) {
+    DIR *d = opendir(dir); struct dirent *e; char hp[1280], g[256];
+    if (!d) return;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") || !guest_name(dir, e->d_name, g, sizeof g)) continue;
+        size_t name = (strlen(g) + 3) & ~(size_t)3;
+        if (e->d_type == DT_DIR) {
+            ++*ndir; *dbytes += 0x18 + name;
+            if (depth < 64 && snprintf(hp, sizeof hp, "%s/%s", dir, e->d_name) < (int)sizeof hp) romfs_tables(hp, ndir, dbytes, nfile, fbytes, depth + 1);
+        } else { ++*nfile; *fbytes += 0x20 + name; }
+    }
+    closedir(d);
+}
+static size_t romfs_work_size(const char *dir) {
+    size_t ndir = 1, dbytes = 0x18, nfile = 0, fbytes = 0;   // the root directory has an entry with an empty name
+    romfs_tables(dir, &ndir, &dbytes, &nfile, &fbytes, 0);
+    return 4 * romfs_buckets(ndir) + dbytes + 4 * romfs_buckets(nfile) + fbytes;
+}
+static int aoc_dir(char *dir, size_t n, int index) {
+    const char *base = getenv("DM_AOC_DIR"); struct stat st;
+    return base && *base && snprintf(dir, n, "%s/%d", base, index) < (int)n && !stat(dir, &st) && S_ISDIR(st.st_mode);
+}
+HLE_FORCE("_ZN2nn2fs31QueryMountAddOnContentCacheSizeEPmi", "fsp-srv; add-on content reads the host directory directly, the cache is the size of its RomFS file table", Result, h_fs_QueryAocCache, size_t *out, int index) {
+    char dir[1024];
+    *out = aoc_dir(dir, sizeof dir, index) ? romfs_work_size(dir) : 0x1000;   // an index the host does not have: the earlier minimum; the mount then fails
+    return RES_OK;
+}
 HLE_FORCE("_ZN2nn2fs17MountAddOnContentEPKciPvm", "fsp-srv; add-on content → DM_AOC_DIR/<index> (read-only)", Result, h_fs_MountAoc, const char *name, int index, void *cache, size_t sz) {
-    (void)cache; (void)sz; const char *base = getenv("DM_AOC_DIR"); char dir[1024]; struct stat st;
-    if (!base || !*base || snprintf(dir, sizeof dir, "%s/%d", base, index) >= (int)sizeof dir || stat(dir, &st) || !S_ISDIR(st.st_mode)) {
-        LOG("fs mount add-on content %s: index %d does not exist (DM_AOC_DIR=%s)", name, index, base ? base : "unset");
+    (void)cache; (void)sz; char dir[1024];
+    if (!aoc_dir(dir, sizeof dir, index)) {
+        LOG("fs mount add-on content %s: index %d does not exist (DM_AOC_DIR=%s)", name, index, getenv("DM_AOC_DIR") ? getenv("DM_AOC_DIR") : "unset");
         return RES_TARGET_NOT_FOUND;
     }
     return mount(name, dir, 1);   // mount_ex logs it
+}
+// System data archives are firmware content, which the host does not have. The one a game has needed so far is 0100000000000802, MiiModel (Mario Kart 8 Deluxe mounts it as MiiResource: and
+// builds Mii heads from it at boot, for the title screen's demo race): the host writes a stand-in with every part empty (hle_mii.c dm_mii_standin) into <DM_TEMP>_sysdata/<id> and mounts it
+// read-only. Any other archive answers "target not found", as for a title that is not installed
+#define SYSDATA_MIIMODEL 0x0100000000000802ull
+int dm_mii_standin(const char *dir);
+static int sysdata_dir(char *dir, size_t n, uint64_t id) {
+    char t[1024];
+    if (id != SYSDATA_MIIMODEL || snprintf(dir, n, "%s_sysdata/%016llx", envdir("DM_TEMP", "run/platform/temp", t, sizeof t), (unsigned long long)id) >= (int)n) return 0;
+    return dm_mii_standin(dir);
+}
+HLE_FORCE("_ZN2nn2fs29QueryMountSystemDataCacheSizeEPmNS_3ncm12SystemDataIdE", "fsp-srv; system data reads the host directory directly, the cache is the size of its RomFS file table", Result, h_fs_QuerySysDataCache, size_t *out, uint64_t id) {
+    char dir[1024];
+    *out = sysdata_dir(dir, sizeof dir, id) ? romfs_work_size(dir) : 0x1000;
+    return RES_OK;
+}
+HLE_FORCE("_ZN2nn2fs15MountSystemDataEPKcNS_3ncm12SystemDataIdEPvm", "fsp-srv; system data: the host's MiiModel stand-in, nothing else", Result, h_fs_MountSysData, const char *name, uint64_t id, void *cache, size_t sz) {
+    (void)cache; (void)sz; char dir[1024];
+    if (!sysdata_dir(dir, sizeof dir, id)) { LOG("[RED] fs mount system data %s: the host has no %016llx", name, (unsigned long long)id); return RES_TARGET_NOT_FOUND; }
+    return mount(name, dir, 1);
 }
 // IsMounted: the original SDK checks its own mount table, which stays empty because the host takes over mounting. Engage (IL2CPP) uses it to check whether "rom:" is mounted before opening a file; a "no" fails with an invalid-parameter error (0x57) and global-metadata.dat cannot be opened
 HLE_FORCE("_ZN2nn2fs9IsMountedEPKc", "fsp-srv; looks up the host mount table", int, h_fs_IsMounted, const char *name) {   // bool in w0: 1 / 0
@@ -411,6 +469,23 @@ HLE_FORCE("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", "fsp-srv; save data 
     char dd[1024]; strlcpy(dd, d, sizeof dd); size_t L = strlen(dd); while (L > 1 && dd[L - 1] == '/') dd[--L] = 0;   // strip trailing slashes (.work / .new are appended at the same level)
     return mount_ex(name, dd, 0, 1);
 }
+// Device save data: one save for the console instead of one per user. Animal Crossing: New Horizons keeps its island there (3.0.3's main mounts no account save data at all); the host
+// has one player, so it is the host save directory with its transaction, as the account save. Its size and extension follow the account save's.
+// A game that mounts both is given two saves, as on Horizon: the device save is <DM_SAVE>_device, a transaction of its own. Mario Kart 8 Deluxe mounts CommonSave (device) and then
+// UserSave (account, main+0x8b0c84), and at boot its save manager deletes CommonSave:/userdata.dat (main+0x8b1910, through its file device's DeleteFile); in one shared directory that
+// was UserSave's own userdata.dat, so every boot started a new save. Decided by main's imports: of the games on hand only this one imports both, and ACNH's islands stay where they are
+HLE_FORCE("_ZN2nn2fs19MountDeviceSaveDataEPKc", "fsp-srv; device save data → the host save directory (one player, as the account save), or a save of its own when main mounts account save data too", Result, h_fs_MountDeviceSave, const char *name) {
+    if (!dm_main_imports("_ZN2nn2fs13MountSaveData")) return h_fs_MountSave(name, NULL);
+    const char *d = getenv("DM_SAVE");
+    if (!d) die("DM_SAVE is not set: point it at a writable copy of a save directory");
+    char dd[1024]; strlcpy(dd, d, sizeof dd); size_t L = strlen(dd); while (L > 1 && dd[L - 1] == '/') dd[--L] = 0;
+    strlcat(dd, "_device", sizeof dd);
+    return mount_ex(name, dd, 0, 1);
+}
+HLE_FORCE("_ZN2nn2fs21GetDeviceSaveDataSizeEPlS1_", "fsp-srv; device save data size: 256 MB data + 256 MB journal", Result, h_fs_DeviceSaveSize, int64_t *size, int64_t *journal) { return h_fs_SaveSize(size, journal, NULL); }
+HLE_FORCE("_ZN2nn2fs20ExtendDeviceSaveDataEll", "fsp-srv; extend device save data: the host directory has no size limit", Result, h_fs_ExtendDeviceSave, int64_t size, int64_t journal) { return h_fs_ExtendSave(NULL, size, journal); }
+// The restore flag marks save data the system restored from a backup (cloud save data backup), which a game may check once and then clear with the commit option below; the host never restores
+HLE_FORCE("_ZN2nn2fs22GetSaveDataRestoreFlagEPbPKc", "fsp-srv; save data restored from a backup: never", Result, h_fs_RestoreFlag, uint8_t *out, const char *name) { (void)name; *out = 0; return RES_OK; }
 static _Atomic uint64_t g_save_commits;   // number of successful commits (used by the front end when going to background to wait for "the game's current save has been committed")
 uint64_t dm_fs_commit_count(void) { return atomic_load(&g_save_commits); }
 // Both Commit overloads share this transaction engine. Caller holds the path
@@ -491,6 +566,8 @@ out:
     if (notify_error) front_save_failed(notify_error);
     return r;
 }
+// The overload with a CommitOption (Animal Crossing: New Horizons 3.0.3): its only flag clears the restore flag, which the host never sets
+HLE_FORCE("_ZN2nn2fs6CommitEPKcRKNS0_12CommitOptionE", "fsp-srv; same as Commit (the option only clears the restore flag)", Result, h_fs_CommitOpt, const char *name, const void *opt) { (void)opt; return h_fs_Commit(name); }
 // SDK 11's old name: CommitSaveData(mount name) is the later Commit (Metroid Dread)
 HLE_FORCE("_ZN2nn2fs14CommitSaveDataEPKc", "fsp-srv; same as Commit (SDK 11's old name)", Result, h_fs_CommitSaveData, const char *name) { return h_fs_Commit(name); }
 HLE_FORCE("_ZN2nn2fs7UnmountEPKc", "fsp-srv; the mount table is permanent, unmounting is a no-op", void, h_fs_Unmount, const char *name) { (void)name; }

@@ -30,7 +30,17 @@ static class SwshXlate
     {
         readonly byte[] _code; readonly JsonObject _job; int _binding = 1; public readonly List<string> Notes = new();
         readonly byte[] _c1;
-        public Accessor(byte[] code, JsonObject job) { _code = code; _job = job; _c1 = job["c1"] is JsonNode h ? Convert.FromHexString((string)h) : Array.Empty<byte>(); }
+        public Accessor(byte[] code, JsonObject job, Dictionary<int, SamplerType> imageTypes = null) { if (job["geometry_topology"] != null) _binding = 40; _code = code; _job = job; _c1 = job["c1"] is JsonNode h ? Convert.FromHexString((string)h) : Array.Empty<byte>(); _imageTypes = imageTypes; }
+        // A texture query on an image handle (TXQ on c2 0x120 + 8 r: Unreal's GetDimensions on the RWTexture3D a compute shader writes) asks the type of that handle, which a table built
+        // without the game's PC shaders does not answer, and the 2D default took a 3D image's depth from its width. The shader's own surface instructions give the image's type: the
+        // first translation records that a query went unanswered (ImageQueryGuessed), and Main translates again with the types of the images it found, by c2 handle (ImageTypesOf)
+        readonly Dictionary<int, SamplerType> _imageTypes; public bool ImageQueryGuessed;
+        public static Dictionary<int, SamplerType> ImageTypesOf(ShaderProgram p)
+        {
+            var types = new Dictionary<int, SamplerType>();
+            foreach (var im in p.Info.Images) if (im.CbufSlot == 2 || im.CbufSlot < 0) types[im.HandleIndex] = im.Type & (SamplerType.Mask | SamplerType.Array);
+            return types;
+        }
         // c1 constant segment (the 0x100 bytes before the control segment in the shader package): the jump table of indirect jump BRX lives here (LDC c[1]); without it the translator cannot resolve jump targets and control flow goes wrong (particle shaders loop forever)
         public uint ConstantBuffer1Read(int offset) { if (offset >= 0 && offset + 4 <= _c1.Length) return BitConverter.ToUInt32(_c1, offset); Notes.Add($"c1 read out of bounds +{offset:X} (c1 length {_c1.Length})"); return 0; }
         // All resources go into set 0, each with a distinct binding number (spirv-cross emits them as one argument buffer); the translator's convention of giving the buffer of constant segment number index binding = index+1 is not relied on
@@ -64,6 +74,11 @@ static class SwshXlate
         {
             int slot = Slot(handle, cbufSlot, false), islot = Slot(handle, cbufSlot, true);
             string t = (slot >= 0 ? Get("tex", slot) : null) ?? (islot >= 0 ? Get("img", islot) : null);
+            if (t == null && islot >= 0 && cbufSlot < 0)
+            {
+                if (_imageTypes != null && _imageTypes.TryGetValue(handle, out SamplerType it)) { Notes.Add($"texture handle {handle:X} is image slot {islot}: type {it} from the shader's image instructions"); return it; }
+                ImageQueryGuessed = true;
+            }
             if (t == null) { Notes.Add($"texture handle {handle:X} (constant buffer {cbufSlot}, slot {slot}) has no type in the answer table, using 2D"); return SamplerType.Texture2D; }
             return t switch
             {
@@ -91,12 +106,13 @@ static class SwshXlate
         public int QueryComputeLocalSizeZ() => Local(2);
         public int QueryComputeSharedMemorySize() => _job["shared"] is JsonNode n ? (int)n : 0;   // the shared memory size in the compute shader's control section (shader_split.py)
         static AttributeType Attr(string s) => s switch { "sint" => AttributeType.Sint, "uint" => AttributeType.Uint, _ => AttributeType.Float };
+        public bool QueryGeometryInputFixed() => _job["geometry_topology"] != null;
         public GpuGraphicsState QueryGraphicsState()
         {
             Array32<AttributeType> attr = default; Array8<AttributeType> fout = default;
             if (_job["attr"] is JsonObject a) foreach (var kv in a) attr[int.Parse(kv.Key)] = Attr((string)kv.Value);
             if (_job["fout"] is JsonObject f) foreach (var kv in f) fout[int.Parse(kv.Key)] = Attr((string)kv.Value);
-            return new GpuGraphicsState(false, InputTopology.Triangles, false, TessPatchType.Triangles, TessSpacing.EqualSpacing,
+            return new GpuGraphicsState(false, _job["geometry_topology"] is JsonNode gt ? (InputTopology)(int)gt : InputTopology.Triangles, false, TessPatchType.Triangles, TessSpacing.EqualSpacing,
                 false, false, false, false /* depth not rewritten: dmsh_build.py adds the GL entry point (see the file header) */, false, 1f, AlphaTestOp.Always, 0f, attr, false, fout, false,
                 false /* no Y flip */, true /* origin upper-left */, false);
         }
@@ -142,18 +158,33 @@ static class SwshXlate
                 // Job debug = false: turn off DebugMode (DebugMode skips the AST optimizer and the output is full of temporaries; semantics unchanged)
                 var flags = (job["debug"] is JsonNode dbg && !(bool)dbg ? 0 : TranslationFlags.DebugMode) | ((string)job["stage"] == "cs" ? TranslationFlags.Compute : 0);
                 var ctx = Translator.CreateContext(0, acc, new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags));
-                ShaderProgram p = ctx.Translate();
+                bool geometry = job["geometry_topology"] != null;
+                ShaderProgram p = ctx.Translate(geometry);
+                Dictionary<int, SamplerType> imageTypes = null;
+                if (acc.ImageQueryGuessed && (imageTypes = Accessor.ImageTypesOf(p)).Count > 0)   // a query on an image handle went unanswered: again with the images' types (see Accessor)
+                {
+                    acc = new Accessor(code, job, imageTypes);
+                    ctx = Translator.CreateContext(0, acc, new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags));
+                    p = ctx.Translate(geometry);
+                }
                 if (UsesFloat64(p.BinaryCode))   // Tears of the Kingdom 1.4.3: 30 shaders used double and failed in the Metal compiler
                 {
-                    job["softfloat64"] = true; acc = new Accessor(code, job);
+                    job["softfloat64"] = true; acc = new Accessor(code, job, imageTypes);
                     ctx = Translator.CreateContext(0, acc, new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags));
-                    p = ctx.Translate(); acc.Notes.Add("FP64 lowered to FP32 (DoubleToFloat)");
+                    p = ctx.Translate(geometry); acc.Notes.Add("FP64 lowered to FP32 (DoubleToFloat)");
+                }
+                if (geometry)
+                {
+                    // A fresh context: translation mutates the decoded program.
+                    var reader = Translator.CreateContext(0, new Accessor(code, job, imageTypes), new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags));
+                    File.WriteAllBytes(Path.Combine(outDir, key + ".reader.spv"), reader.GenerateVertexPassthroughForCompute().BinaryCode);
                 }
                 File.WriteAllBytes(Path.Combine(outDir, key + ".spv"), VertexCounterLowering.Apply(code, (string)job["stage"], p.BinaryCode, acc.Notes));
                 var res = new JsonObject
                 {
                     ["key"] = key, ["stage"] = (string)job["stage"], ["notes"] = new JsonArray(acc.Notes.ConvertAll(n => (JsonNode)n).ToArray()),
                     ["cbufs"] = new JsonArray(), ["sbufs"] = new JsonArray(), ["textures"] = new JsonArray(), ["images"] = new JsonArray(),
+                    ["geometry_stride"] = geometry ? ctx.GetResourceReservations().OutputSizePerInvocation : 0,
                     ["uses_frag_coord"] = p.Info.UsesFragCoord, ["frag_out_map"] = p.Info.FragmentOutputMap,
                 };
                 foreach (var b in p.Info.CBuffers) res["cbufs"].AsArray().Add(new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot });

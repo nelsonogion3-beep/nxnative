@@ -65,8 +65,10 @@ typedef struct thr {
     int closed;                // Handle closed: the object is freed only when this holds together with exited (Horizon: the thread object goes away with the last reference)
     uint64_t nsvc;             // SVC count (for the state dump)
     uint64_t nyield, nyield_seen, nbackoff, nbackoff_seen;   // Yields (SleepThread 0/-1/-2) and those the back-off turned into short sleeps, with both counts at the last power report (dm_yield_top)
+    uint64_t nspin, nspin_seen, spin_site; const char *spin_mod;   // Spin wait passes (dm_spin_wait; those that yield count in nyield too) and where the last one was
+    uint64_t srun_svc, srun_t0, spin_ret;     // Current spin wait: nsvc at its passes, when it began, when the last pass returned
     uint64_t cpu_seen_us;                     // CPU time (µs) at the last power report (dm_thread_cpu)
-    uint64_t yrun_svc, yrun_t0;               // Current run of yields: nsvc of the last yield, and when the run began (a run lasts while no other SVC comes between two yields)
+    uint64_t yrun_svc, yrun_t0, yrun_sig;     // Current run of yields: nsvc of the last yield, when the run began, and the caller's x19–x28 at the last yield (a run lasts while no other SVC comes between two yields and those registers stay the same, thr_yield)
     mach_port_t mport;         // Host thread port (to get CPU time)
     _Atomic int qos_pending;   // SetThreadPriority from another thread changed prio: the thread applies the new class at its next SVC (only a thread can set its own QoS)
     uint32_t qos;
@@ -543,7 +545,7 @@ void svc_thread_dump(void) {
 // On per the game profile's core_preempt (off by default: Mario's loader threads would wait for busy high-priority decompression threads, pushing its first frame from 0.6 s to 2.9 s); DM_PREEMPT=0 / 1 overrides the profile. Counts are in the thread state dump
 static int svc_thread_impl(int num, uint64_t *regs);
 // Yield back-off: on the Switch a yield with nothing else runnable costs nothing, but a guest loop that polls the tick and yields (Three Houses' frame limiter main+0x5be430 waited out each 33 ms frame this way:
-// 228,105 yields per frame on an iPhone, a P-core at full clock; a per-build cut in patch_nso.py now makes it sleep) becomes a host busy spin. A run of yields with no other SVC between them is let through as plain sched_yield for its first 2 ms;
+// 228,105 yields per frame on an iPhone, a P-core at full clock; a per-build cut in patch_nso.py now makes it sleep) becomes a host busy spin. A run of yields with no other SVC between them (and no progress, thr_yield) is let through as plain sched_yield for its first 2 ms;
 // after that each yield sleeps an eighth of the run so far, between 10 and 250 µs (a 23 ms limiter wait: about 90 sleeps instead of 200k yields, ending at most 250 µs late; idle workers polling for jobs the same).
 // The back-off used to start after 200 µs: that also caught Tears of the Kingdom's main thread waiting for its ModuleSystem workers (about 350 yields a frame, runs of a few hundred µs on the
 // frame's critical path). A sleep that overran the moment the workers finished pushed frames past 33 ms, and the game then drops itself to present interval 3 (20 fps) for a while:
@@ -559,17 +561,69 @@ static uint64_t yield_backoff_ns(uint64_t run_ns) {
     uint64_t s = run_ns / 8; if (s < 10000) s = 10000;
     return s < (uint64_t)cap ? s : (uint64_t)cap;
 }
-// The threads that yielded most since the last call (the power line every 300 frames, hle_nvn.c): "handle name N (back-off sleeps M)", at most two
+// sched_yield, or a short sleep once the wait has lasted run_ns past the back-off's start
+static void yield_for(thr_t *me, uint64_t run_ns) {
+    uint64_t bo = yield_backoff_ns(run_ns);
+    if (bo) { me->nbackoff++; me->sleeping = 1; struct timespec ts = {0, (long)bo}; nanosleep(&ts, 0); me->sleeping = 0; }
+    else sched_yield();
+}
+// One yield SVC of the calling thread (me may be NULL); regs = the guest registers at the SVC.
+// A run of yields is a wait only while the loop makes no progress: it also starts again when the caller's callee-saved registers x19–x28 differ from the last yield's. The SDK's
+// YieldThread reaches the SVC through tail branches only (SDK 20: nn::os::YieldThread → ThreadManagerImplByHorizon::YieldThread, mov x0,#-1 → the svc stub), so they are the loop's own:
+// a poll keeps its pointers and deadline there (Three Houses' limiter: x19 points at the last frame end, x23 is the target, the time passed is in x8; Galaxy 2's Hagi sleep poll keeps
+// its state behind x19), while a loop that yields between steps of work moves its counters, and such a yield returns at once, with no host call, as one with no other thread of its
+// priority to run does on the Switch. Animal Crossing: New Horizons' SaveProc builds a new island in grid walks that yield once per cell (main+0x157d020, cell x and y in w21 / w20):
+// with the back-off each yield slept 250 µs, about 2,600 cells a second, and the screen stayed black with the loading icon for 77 s after the opening movie (now about 10 s).
+// Breath of the Wild's PlacementMgr and RadarMgr yield once per item of their batches too (a list pointer and a count move; RadarMgr's batch is 94,263 items, which the back-off
+// stretched to about 30 s): standing outdoors on the Mac, CPU energy 0.35–0.74 → 0.21–0.34 W at 60 fps, CPU 76–83% → 96–106% of a core, frame interval p99 19 → 20–21 ms.
+// With sched_yield on each such yield (about 200,000 a second) it was 108–121% of a core and 0.38–0.70 W
+static void thr_yield(thr_t *me, const uint64_t *regs) {
+    if (!me) { sched_yield(); return; }
+    uint64_t y0 = now_ns(), sig = 0xcbf29ce484222325ull;
+    for (int i = 19; i <= 28; i++) sig = (sig ^ regs[i]) * 0x100000001b3ull;
+    int moved = me->yrun_svc + 1 == me->nsvc && me->yrun_sig != sig;   // the loop moved on since its last yield
+    me->nyield++; if (me->yrun_svc + 1 != me->nsvc || moved) me->yrun_t0 = y0; me->yrun_svc = me->nsvc; me->yrun_sig = sig;
+    if (!moved) yield_for(me, y0 - me->yrun_t0);
+    if (me->handle == 0x1001) { g_main_yield_ns += now_ns() - y0; g_main_yield_n++; }
+}
+// Spin waits (patch_nso.py "Spin waits"): a guest loop that polls memory with no SVC, which the rewriter has made go through a spin gate on every pass after the first. On the Switch
+// such a poll costs nothing while another thread of its core has work (a higher-priority one preempts it); here it takes a host core from the threads doing the work: Paper Mario:
+// The Thousand-Year Door's three job workers (main+0xa8e680) spun at 94% of a core each in Rogueport on an iPhone, which ran at 24 fps. The gate alone slows the poll down, and on the
+// Mac that was the whole gain (the workers' CPU fell about tenfold, see docs/development.md): most waits are short handoffs between workers. A wait (passes with no SVC between them
+// and at most SPIN_GAP_NS of guest work between two) therefore polls on for its first DM_SPIN_POLL µs (2000, the yield back-off's start), and then sleeps as a run of yields does
+// (yield_backoff_ns, DM_YIELD_BACKOFF), which leaves the core to the threads doing the work. A sched_yield on every pass instead (DM_SPIN_POLL=0) raised the Mac's frame p95 by 2-5 ms,
+// as a yield there hands the core to other processes. DM_SPIN=0: no sleeps either. gate = the gate's address, site = the loop head (module offset)
+#define SPIN_GAP_NS 20000
+void dm_spin_wait(uint64_t gate, uint64_t site) {
+    static int on = -1; static uint64_t poll_ns;
+    if (on < 0) { const char *e = getenv("DM_SPIN"), *p = getenv("DM_SPIN_POLL"); poll_ns = (p && *p ? strtoull(p, 0, 10) : 2000) * 1000; on = !(e && *e && atoi(e) == 0);
+                  if (!on) LOG("DM_SPIN=0: spin waits do not yield or sleep"); else if (p && *p) LOG("DM_SPIN_POLL: spin waits poll for %llu µs, then yield", (unsigned long long)(poll_ns / 1000)); }
+    thr_t *me = pthread_getspecific(g_keythr);
+    if (!me) return;
+    uint64_t now = now_ns();
+    if (me->srun_svc != me->nsvc || now - me->spin_ret > SPIN_GAP_NS) me->srun_t0 = now;   // a new wait
+    me->srun_svc = me->nsvc; me->nspin++;
+    if (site != me->spin_site || !me->spin_mod) { const module_t *m = module_of((void *)gate); me->spin_mod = m ? m->name : "?"; me->spin_site = site; }
+    if (on && now - me->srun_t0 >= poll_ns) { me->nyield++; yield_for(me, now - me->srun_t0); }
+    me->spin_ret = now_ns();
+}
+// The threads that yielded or passed through spin waits most since the last call (the power line every 300 frames, hle_nvn.c): "handle name N (back-off sleeps M)", at most two,
+// N the yields (spin wait passes that yielded among them), with the spin wait passes and the last one's site ("; spin passes K, last at main+0x…")
 void dm_yield_top(char *out, size_t n) {
-    thr_t *top[2] = {0}; uint64_t d[2] = {0}, b[2] = {0};
+    thr_t *top[2] = {0}; uint64_t d[2] = {0}, b[2] = {0}, s[2] = {0}, r[2] = {0};
     pthread_mutex_lock(&G);
     for (thr_t *t = g_all; t; t = t->all) {
-        uint64_t y = t->nyield - t->nyield_seen, bo = t->nbackoff - t->nbackoff_seen; t->nyield_seen = t->nyield; t->nbackoff_seen = t->nbackoff;
-        if (y > d[0]) { top[1] = top[0]; d[1] = d[0]; b[1] = b[0]; top[0] = t; d[0] = y; b[0] = bo; } else if (y > d[1]) { top[1] = t; d[1] = y; b[1] = bo; }
+        uint64_t y = t->nyield - t->nyield_seen, bo = t->nbackoff - t->nbackoff_seen, sp = t->nspin - t->nspin_seen, k = y + sp;
+        t->nyield_seen = t->nyield; t->nbackoff_seen = t->nbackoff; t->nspin_seen = t->nspin;
+        if (k > r[0]) { top[1] = top[0]; d[1] = d[0]; b[1] = b[0]; s[1] = s[0]; r[1] = r[0]; top[0] = t; d[0] = y; b[0] = bo; s[0] = sp; r[0] = k; }
+        else if (k > r[1]) { top[1] = t; d[1] = y; b[1] = bo; s[1] = sp; r[1] = k; }
     }
     size_t o = 0; char nb[32];
-    for (int i = 0; i < 2 && top[i] && o < n; i++)
-        o += snprintf(out + o, n - o, "%s%#x '%s' %llu times (back-off sleeps %llu)", i ? ", " : "", top[i]->handle, thr_name(top[i], nb, sizeof nb), (unsigned long long)d[i], (unsigned long long)b[i]);
+    for (int i = 0; i < 2 && top[i] && o < n; i++) {
+        o += snprintf(out + o, n - o, "%s%#x '%s' %llu times (back-off sleeps %llu", i ? ", " : "", top[i]->handle, thr_name(top[i], nb, sizeof nb), (unsigned long long)d[i], (unsigned long long)b[i]);
+        if (o < n && s[i]) o += snprintf(out + o, n - o, "; spin passes %llu, last at %s+%#llx", (unsigned long long)s[i], top[i]->spin_mod, (unsigned long long)top[i]->spin_site);
+        if (o < n) o += snprintf(out + o, n - o, ")");
+    }
     pthread_mutex_unlock(&G);
     if (!o && n) snprintf(out, n, "none");
 }
@@ -602,6 +656,19 @@ static void sleep_precise(uint64_t dl) {
         uint64_t rem = dl - now, s = rem < 100000 ? rem : rem - rem / 4;
         struct timespec ts = {(time_t)(s / 1000000000u), (long)(s % 1000000000u)}; nanosleep(&ts, 0);
     }
+}
+// A guest thread sleeps ns nanoseconds the way SleepThread does: on the guest clock under the deterministic clock, else on time (sleep_precise). Also for host hooks that stand for a
+// call which blocks on hardware (hle_net.c: Poll / Select with nothing to wait on)
+void dm_guest_sleep_ns(int64_t ns) {
+    if (ns <= 0) return;
+    if (dm_detclock_enabled()) {
+        uint64_t deadline = guest_ns() + (uint64_t)ns;
+        while (guest_ns() < deadline) { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
+        return;
+    }
+    thr_t *me = pthread_getspecific(g_keythr); if (me) me->sleeping = 1;
+    sleep_precise(now_ns() + (uint64_t)ns);
+    if (me) me->sleeping = 0;
 }
 int svc_thread(int num, uint64_t *regs) {
     int r = svc_thread_impl(num, regs);
@@ -646,22 +713,11 @@ static int svc_thread_impl(int num, uint64_t *regs) {
     case 0x0A: thread_exit(cur()); return 1;
     case 0x0B: {  // SleepThread(x0 ns); 0/-1/-2 = the various kinds of yield
         int64_t ns = (int64_t)regs[0];
-        if (ns > 0 && dm_detclock_enabled()) {
-            uint64_t deadline = guest_ns() + (uint64_t)ns;
-            while (guest_ns() < deadline) { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
-        } else if (ns >= 20000) { thr_t *me = pthread_getspecific(g_keythr); if (me) me->sleeping = 1; sleep_precise(now_ns() + (uint64_t)ns); if (me) me->sleeping = 0; }
+        if ((ns > 0 && dm_detclock_enabled()) || ns >= 20000) dm_guest_sleep_ns(ns);
         // Yield (0 / -1 / -2), and sleeps shorter than 20 µs, which sleep_precise would return from at once: Super Mario Galaxy's Hagi polls with SleepThread(100 ns) (main+0x517c),
         // which kept a core at 100% (1.4 billion calls in 200 s); as yields they get the back-off below.
         // Count and time of the main thread's yields are recorded: a render task graph's "wait for everything to finish" is often pure polling + yield; measure how much of a frame it takes
-        else {
-            thr_t *me = pthread_getspecific(g_keythr);
-            uint64_t y0 = me ? now_ns() : 0;
-            if (me) { me->nyield++; if (me->yrun_svc + 1 != me->nsvc) me->yrun_t0 = y0; me->yrun_svc = me->nsvc; }
-            uint64_t bo = me ? yield_backoff_ns(y0 - me->yrun_t0) : 0;
-            if (bo) { me->nbackoff++; me->sleeping = 1; struct timespec ts = {0, (long)bo}; nanosleep(&ts, 0); me->sleeping = 0; }
-            else sched_yield();
-            if (me && me->handle == 0x1001) { g_main_yield_ns += now_ns() - y0; g_main_yield_n++; }
-        }
+        else thr_yield(pthread_getspecific(g_keythr), regs);
         return 1;
     }
     case 0x0C: { thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)t->prio : 0; return 1; }

@@ -45,7 +45,7 @@ HLE_FORCE("_ZN5movie9Extractor13SetDataSourceEPKc", "movie demuxer: the host doe
 #define MD_NIN 4                 // input buffers
 #define MD_INCAP (4u << 20)      // 4 MB per input buffer (a 1080p VP9 packet is far smaller)
 #define MD_NOUT 64               // output slots, at most (an audio decoder's count)
-#define MD_NOUT_VIDEO 8          // a video decoder's output slots
+#define MD_NOUT_VIDEO 16         // a video decoder's output slots
 #define MD_NO_INPUT 0x1011       // SDK: no free input
 #define MD_NO_OUTPUT 0x100e      // SDK: no output ready
 #define MD_STALE_NS 250000000ull // how long an input the client held across a flush stays withheld (h_movie_AcqIn)
@@ -443,8 +443,10 @@ static void md_pump(mdec_t *d) {
         int got = 0, avc = d->type == MD_TYPE_AVC;
         int eos = (pk.flags & 4) != 0;   // MediaCodec BUFFER_FLAG_END_OF_STREAM
         if (eos && (pk.pts < 0 || (uint32_t)pk.size >= MD_INCAP)) pk.size = 0;   // Monster Hunter Rise ends a stream with time -1 and the whole input buffer (4 MB) as its length: no data (decoding it gave VideoToolbox -12909 and AudioToolbox -50); an end-of-stream packet as long as the whole buffer is the same, with a real time (from PR #36)
+        // H.264 end of stream: this packet's output takes the first queued picture (jflush). Taking none put a black picture without the flag ahead of the last
+        // `depth` pictures, a black flash before the movie's last frames
         if ((pk.size > 0 && (d->type == MD_TYPE_VP9 || MD_AUDIO(d) || avc)) || (avc && eos)) {
-            d->jp = d->in[pk.in] + pk.off; d->jn = pk.size; d->jslot = slot; d->jpts = pk.pts; d->jflush = 0; md_job(d, MDJ_DECODE); got = d->jgot; }
+            d->jp = d->in[pk.in] + pk.off; d->jn = pk.size; d->jslot = slot; d->jpts = pk.pts; d->jflush = avc && eos; md_job(d, MDJ_DECODE); got = d->jgot; }
         int more = avc && eos && d->avc && mavc_queued(d->avc) > 0;   // H.264 pictures still queued: they follow this output, the last of them carries the end-of-stream flag
         pthread_mutex_lock(&d->mu);
         d->infree[d->ninfree++] = pk.in;
@@ -474,13 +476,17 @@ HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11De
     mdec_t *d = calloc(1, sizeof *d);
     pthread_mutex_init(&d->mu, NULL); pthread_mutex_init(&d->dmu, NULL); pthread_mutex_init(&d->wmu, NULL); pthread_cond_init(&d->wcv, NULL);
     d->type = type; d->fmt = fmt; d->mode = mode;
-    // An audio decoder keeps 64 outputs (about 1.4 s of AAC or Vorbis), a video decoder 8. The host decodes far faster than the Switch, and a player that feeds its decoders in file order
+    // An audio decoder keeps 64 outputs (about 1.4 s of AAC or Vorbis), a video decoder 16. The host decodes far faster than the Switch, and a player that feeds its decoders in file order
     // stops at the first track with no free input. DRAGON QUEST XI S's player fills every track before it plays (IsPreDecodingCompleted: one output queued on each, polled once a frame),
     // while its render thread's first fetch takes every decoded picture and shows the newest. With 8 audio outputs, both audio tracks were full before 240 ms of video was decoded: the
     // extractor waited for an audio input, no picture followed the ones that fetch took, and the opening movie never started (in about half the boots on the Mac: whichever of the poll and the fetch came first).
     // Unity 2022.3's movie player (Monster Train 2's intro, an MP4 of H.264 and AAC interleaved packet by packet) takes every output it is offered and starts playing once it holds about
     // half a second of audio: measured with 64 audio and 8 video slots, it starts holding 27 audio and 8 video outputs and peaks at 30 audio, close to 32 (8 audio slots hang it on a black
-    // screen whatever the video count: 32 video slots did not help). An audio slot is a PCM buffer allocated when first used (MD_PCM_CAP, 128 KB), so 64 cost at most 8 MB
+    // screen whatever the video count: 32 video slots did not help). An audio slot is a PCM buffer allocated when first used (MD_PCM_CAP, 128 KB), so 64 cost at most 8 MB.
+    // Video got 16 slots for Animal Crossing: New Horizons' in-flight movie (Movie/OpeningMovie.webm, VP9 1080p and Vorbis through movie::Extractor): its player also holds every output it is
+    // offered (16 of 16 video, 59 of 64 audio), so how far its extractor gets ahead of the picture on screen is the video slots plus the 4 queued packets. With 8 that was 0.4 s, and the
+    // audio behind the next video packet, whose clock the player follows, ran dry: 86 pictures in 25 s, a black screen with a loading icon. With 16 (or 32) all 1,960 play at 30 fps.
+    // A video slot is allocated when first used, so the 8 more cost a greedy player 24 MB of NV12 at 1080p (64 MB as RGBA)
     d->nout = audio ? MD_NOUT : MD_NOUT_VIDEO;
     for (int i = 0; i < MD_NIN; i++) { d->in[i] = malloc(MD_INCAP); d->infree[i] = i; }
     d->ninfree = MD_NIN;
@@ -490,6 +496,9 @@ HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11De
     self[1] = d;
     LOG("[movie] decoder %p: type %d output %d mode %d priority %d", (void *)self, type, fmt, mode, prio);
 }
+// SDK 4's constructor has no priority argument (Dark Souls Remastered, NintendoSDK_movie 4.5.0). Without this take-over the SDK built its own decoder and the host's Configure read it as a host one (a call through a null pointer)
+HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeE", "movie decoder (SDK 4, no priority): host implementation", void, h_movie_Decoder4,
+          void **self, int type, int fmt, int mode) { h_movie_Decoder(self, type, fmt, mode, 0); }
 static void md_free(void **self) {
     mdec_t *d = md_of(self); if (!d) return;
     md_defer_drop(d);
@@ -667,6 +676,11 @@ static void md_format(mdec_t *d, void *md) {
     G.set_rect(md, "crop", 0, 0, w - 1, h - 1);
     G.set_i32(md, "stride", stride); G.set_i32(md, "slice-height", slice);
     G.set_i32(md, "nv12-y-stride", stride); G.set_i32(md, "nv12-y-offset", 0); G.set_i32(md, "nv12-uv-offset", stride * slice);
+    // The interleaved UV plane has the luma plane's byte stride. CRI Sofdec2's player (Catherine: Full Body, main+0x34e6bc) reads it with the other three and checks none of the results:
+    // without it the chroma stride was stack garbage and its NV12 → RGB conversion read far outside guest memory on the first picture (main+0x344f74); in DRAGON QUEST VII Reimagined
+    // every chroma row was read from the first one (a grey movie with vertical bands). The picture size again, as the SDK's DecoderImpl::GetOutputBufferFormatFromDecoder
+    // (SDK 19 subsdk0+0x121f50) also sets it
+    G.set_i32(md, "nv12-uv-stride", stride); G.set_i32(md, "nv12-width", w); G.set_i32(md, "nv12-height", h);
 }
 HLE_FORCE("_ZN5movie7Decoder15GetOutputFormatEPNS_9MediaDataE", "movie decoder: output format (NV12)", int, h_movie_OutFmt, void **self, void *md) {
     mdec_t *d = md_of(self); if (!d) return 0x1000;
@@ -695,7 +709,8 @@ HLE_FORCE("_ZN5movie7Decoder19GetOutputBufferSizeEPiS1_", "movie decoder: output
 int nvn_host_write_texture(const void *nvntex, const void *src, int w, int h, size_t row, int *tw, int *th);
 int nvn_host_signal_sync(void *nvnsync);
 static int md_out_tex(mdec_t *d, int i, void *buf) {
-    if (!G.nvn_sync) G.nvn_sync = msym("_ZNK5movie6Buffer10GetNvnSyncEv");
+    // SDK 4's Buffer has no sync object (Dark Souls Remastered's subsdk0 exports no GetNvnSync): the game reads the texture once GetOutputBuffer returns, which the CPU write already satisfies
+    static int sync_looked; if (!sync_looked) { G.nvn_sync = guest_sym("_ZNK5movie6Buffer10GetNvnSyncEv"); sync_looked = 1; }
     uint8_t *p = G.data(buf); size_t cap = G.cap(buf);
     if (!p || cap < 8) { LOG("[RED] movie: client buffer in native-texture mode is %zu bytes, needs 8 (a texture object)", cap); return 0x100b; }
     void *tex = p; int tw = 0, th = 0, f = nvn_host_write_texture(tex, NULL, 0, 0, 0, &tw, &th);
@@ -705,7 +720,7 @@ static int md_out_tex(mdec_t *d, int i, void *buf) {
     // No picture (an end-of-stream output): nothing is drawn and the texture keeps the last frame, as the SDK's consumer has no frame to draw. A black frame here flashed at the
     // end of every loop of Big Brain Academy: Brain vs. Brain's activity previews, which read the end-of-stream output's buffer
     if (d->out[i].pic && d->out[i].frm) nvn_host_write_texture(tex, d->out[i].frm, w, h, (size_t)d->w * 4, NULL, NULL);
-    void *sy = G.nvn_sync(buf); if (sy && nvn_host_signal_sync(sy) && !d->red_dec++) LOG("[RED] movie: the buffer's sync object %p is not an NVNsync", sy);
+    void *sy = G.nvn_sync ? G.nvn_sync(buf) : NULL; if (sy && nvn_host_signal_sync(sy) && !d->red_dec++) LOG("[RED] movie: the buffer's sync object %p is not an NVNsync", sy);
     MD_TRACE(d, 12, "GetOutputBuffer index %d → texture %p (%d×%d format %#x)%s", i, tex, tw, th, f, d->out[i].pic ? "" : " (no picture: the texture keeps its last frame)");
     return 0;
 }
@@ -745,10 +760,12 @@ HLE_FORCE("_ZN5movie7Decoder24ReleaseOutputBufferIndexEi", "movie decoder: relea
     if (i < 0 || i >= d->nout) return 0x100b;
     pthread_mutex_lock(&d->mu);
     d->out[i].used = 0; d->out[i].pic = 0;
-    int queued = d->npend;
+    int queued = d->npend, drain = d->avc_drain;
     pthread_mutex_unlock(&d->mu);
-    MD_TRACE(d, 13, "ReleaseOutputBufferIndex index %d (%d packets queued)", i, queued);
-    if (queued) md_pump(d);
+    MD_TRACE(d, 13, "ReleaseOutputBufferIndex index %d (%d packets queued%s)", i, queued, drain ? ", H.264 pictures draining" : "");
+    // An H.264 drain waits for a free slot too: AI: THE SOMNIUM FILES (Unity 2017.4) held all 16 video slots when its logo movie's end-of-stream packet came, the drain stopped
+    // with no packet queued, the last pictures and the end-of-stream flag never came out, and the game waited for the movie's end for good
+    if (queued || drain) md_pump(d);
     return 0;
 }
 HLE_FORCE("_ZN5movie7Decoder12GetLastErrorEv", "movie decoder: last error (none)", int, h_movie_LastErr, void **self) { (void)self; return 0; }

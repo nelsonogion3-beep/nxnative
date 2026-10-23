@@ -7,7 +7,9 @@
 #include <stdint.h>
 
 enum { NVN_RB_CBUF = 1, NVN_RB_SAMP, NVN_RB_TEX, NVN_RB_IMG, NVN_RB_TBUF,
-       NVN_RB_SBUFP, NVN_RB_SUPPORT, NVN_RB_C1, NVN_RB_DRV0, NVN_RB_DRV2, NVN_RB_SAMPT, NVN_RB_UBOP, NVN_RB_TEXU, NVN_RB_SAMPU, NVN_RB_SAMPI, NVN_RB_SBUFU, NVN_RB_TEXD, NVN_RB_SAMPD, NVN_RB_IMGA };
+       NVN_RB_SBUFP, NVN_RB_SUPPORT, NVN_RB_C1, NVN_RB_DRV0, NVN_RB_DRV2, NVN_RB_SAMPT, NVN_RB_UBOP, NVN_RB_TEXU, NVN_RB_SAMPU, NVN_RB_SAMPI, NVN_RB_SBUFU, NVN_RB_TEXD, NVN_RB_SAMPD, NVN_RB_IMGA, NVN_RB_TEXA, NVN_RB_SAMPA, NVN_RB_GEOMETRY };
+// TEXA / SAMPA: an array of n handles in the driver table c2 that the shader indexes at run time (dmsh_build.py c2_array): element k = the texture / sampler of the slot whose c2 word lies
+// at byte off + 8k (combined, else separate); words outside both tables give the dummy. Luigi's Mansion 3's shadow cascades
 // IMGA: SPIRV-Cross's MSL 2.3 image atomics: a device atomic_uint / atomic_int pointer (<image name>_atomic) beside the image of NVN image slot r; the replay binds the image's storage address
 // TEXD / SAMPD: Ryujinx's fallback for a texture handle it cannot trace to one slot (handle type 4, <stage>_<t|tb|s>_cb0_40000000): an array of n textures / samplers indexed by
 // the handle's texture / sampler ID (capped at n - 1); the replay binds slot k at element k and puts slot indices in c2 (profile key tex_dyn_slots, Octopath Traveler 0)
@@ -24,7 +26,7 @@ typedef struct {
     uint8_t dtt, dpf;        // Dummy texture when the texture slot is unbound: MTLTextureType value, pixel class
     uint16_t reg, aid;       // D3D register number, index within the argument buffer
     uint16_t off;            // TEXU / SAMPU: byte offset of the handle within the uniform buffer; SBUFU: of the 64-bit storage buffer address
-    uint8_t n;               // TEXD / SAMPD: array length (argument buffer entries aid .. aid + n - 1)
+    uint8_t n;               // TEXD / SAMPD, and TEXU / SAMPU arrays (element k = the handle at byte 8k of the uniform buffer): array length (argument buffer entries aid .. aid + n - 1)
     uint8_t f1d;             // TEX: read by 1D integer fetches as 2D rows of 16384 texels (dmsh_build.py "fetch1d"): a buffer texture here is bound as such rows (nvn_mtl.m tbuf_as_2d)
 } nvn_rbind;
 typedef struct {

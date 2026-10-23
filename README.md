@@ -8,12 +8,12 @@ It is not an emulator: the game's own code runs directly on the Apple chip, with
 
 This project is built on other people's work:
 
-- **[d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile)** (MIT) developed this native-execution approach, for Diablo II: Resurrected. nxnative (first called smbw-mobile) started as a copy of its generic parts: the NSO rewriter, the host that stands in for Horizon, the NVN-on-Metal layer and the iOS app shell. Fixes go both ways.
+- **[d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile)** (MIT) developed this native-execution approach, for Diablo II: Resurrected. nxnative started as a copy of its generic parts: the NSO rewriter, the host that stands in for Horizon, the NVN-on-Metal layer and the iOS app shell. Fixes go both ways.
 - **Ryujinx** (MIT): its shader translator (`Ryujinx.Graphics.Shader`, `Ryujinx.Common` and `Spv.Generator` 1.3.2, in `dm/third_party/ryujinx` with a few fixes listed in [its README](dm/third_party/ryujinx/README.md)) turns the games' Maxwell shaders into SPIR-V. Its emulation of the kernel and system services is also a reference when the host's behaviour is in doubt.
 - **[Atmosphère](https://github.com/Atmosphere-NX/Atmosphere)**: its kernel, mesosphère, is the reference for Horizon's synchronization semantics (address arbiter, condition variables).
 - **yuzu**: Maxwell instruction encodings for the shader reference tool, and a cross-check for kernel behaviour.
 - **[LibHac](https://github.com/Thealexbarney/LibHac)**: reads NSPs and layers updates over the base game in `dm/tools/nx_extract`. **hactool** did the first extractions.
-- **[SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross)**: SPIR-V to Metal Shading Language.
+- **[SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross)**: SPIR-V to Metal Shading Language. **[glslang](https://github.com/KhronosGroup/glslang)** compiles the GLSL of OpenGL games to SPIR-V for it.
 - **deko3d** (zlib): its texture layout size algorithm is ported in `dm/gfx/nvn/nvn_tex.c`.
 - **libvpx** (VP9 movies), **stb_vorbis** (movie sound), the **Vulkan headers** and **NVIDIA FLIP** ship in `dm/third_party` with their licenses ([list](dm/third_party/README.md)).
 - **Capstone**, **lz4**, **fontTools** and **XcodeGen** are used by the build.
@@ -42,8 +42,14 @@ Needs iOS / iPadOS 26 or later on an iPhone 15 Pro or newer (A17 Pro chip or lat
 | ![The Great Ace Attorney Chronicles](docs/images/the-great-ace-attorney-chronicles.jpg)<br>The Great Ace Attorney Chronicles<br><sub>IPA ~4 GB</sub> | ![STEINS;GATE RE:BOOT](docs/images/steins-gate-reboot.jpg)<br>STEINS;GATE RE:BOOT<br><sub>IPA ~6 GB</sub> |
 | ![Big Brain Academy: Brain vs. Brain](docs/images/big-brain-academy-brain-vs-brain.jpg)<br>Big Brain Academy: Brain vs. Brain<br><sub>IPA ~0.8 GB</sub> | ![Patrick's Parabox](docs/images/patricks-parabox.jpg)<br>Patrick's Parabox<br><sub>IPA ~0.2 GB</sub> |
 | ![Celeste](docs/images/celeste.jpg)<br>Celeste<br><sub>IPA ~0.9 GB</sub> | ![DRAGON QUEST XI S: Echoes of an Elusive Age – Definitive Edition](docs/images/dragon-quest-xi-s.jpg)<br>DRAGON QUEST XI S: Echoes of an Elusive Age – Definitive Edition<br><sub>IPA ~15 GB · 60 fps (30 on Switch) with update 1.0.4</sub> |
-| ![Monster Train 2](docs/images/monster-train-2.jpg)<br>Monster Train 2<br><sub>IPA ~1.6 GB · 60 fps (30 on Switch) with update 1.1.1</sub> | |
-
+| ![Monster Train 2](docs/images/monster-train-2.jpg)<br>Monster Train 2<br><sub>IPA ~1.6 GB · 60 fps (30 on Switch) with update 1.1.1</sub> | ![Raging Loop](docs/images/raging-loop.jpg)<br>Raging Loop<br><sub>IPA ~0.9 GB</sub> |
+| ![DARK SOULS: REMASTERED](docs/images/dark-souls-remastered-creation.jpg)<br>DARK SOULS: REMASTERED<br><sub>IPA ~4 GB · 60 fps (30 on Switch) with update 1.0.3</sub> | ![Paper Mario: The Thousand-Year Door](docs/images/paper-mario-the-thousand-year-door.jpg)<br>Paper Mario: The Thousand-Year Door<br><sub>IPA ~5 GB · 60 fps (30 on Switch) with update 1.0.1</sub> |
+| ![Hollow Knight: Silksong](docs/images/hollow-knight-silksong.jpg)<br>Hollow Knight: Silksong<br><sub>IPA ~6.4 GB</sub> | ![Catherine: Full Body](docs/images/catherine-full-body.jpg)<br>Catherine: Full Body<br><sub>IPA ~14 GB</sub> |
+| ![Digimon Story Cyber Sleuth: Complete Edition](docs/images/digimon-story-cyber-sleuth.jpg)<br>Digimon Story Cyber Sleuth: Complete Edition<br><sub>IPA ~5 GB</sub> | ![Animal Crossing: New Horizons](docs/images/animal-crossing-new-horizons.jpg)<br>Animal Crossing: New Horizons<br><sub>IPA ~10.5 GB with update 3.0.3</sub> |
+| ![DRAGON QUEST VII Reimagined](docs/images/dragon-quest-vii-reimagined.jpg)<br>DRAGON QUEST VII Reimagined<br><sub>IPA ~5.9 GB with update 1.2.0</sub> | ![FINAL FANTASY RESONANCE](docs/images/final-fantasy-resonance.jpg)<br>FINAL FANTASY RESONANCE<br><sub>IPA ~10 GB · 60 fps (30 on Switch) with update 1.0.1</sub> |
+| ![Luigi's Mansion 3](docs/images/luigis-mansion-3.jpg)<br>Luigi's Mansion 3<br><sub>IPA ~7.5 GB · 60 fps (30 on Switch) with update 1.4.0</sub> | ![AI: THE SOMNIUM FILES](docs/images/ai-the-somnium-files.jpg)<br>AI: THE SOMNIUM FILES<br><sub>IPA ~8.3 GB</sub> |
+| ![ANIMAL WELL](docs/images/animal-well.png)<br>ANIMAL WELL<br><sub>IPA ~54 MB · update 1.0.10</sub> | ![AI: THE SOMNIUM FILES - nirvanA Initiative](docs/images/ai-the-somnium-files-nirvana-initiative.jpg)<br>AI: THE SOMNIUM FILES - nirvanA Initiative<br><sub>IPA ~11.6 GB · update 1.0.2</sub> |
+| ![Mario Kart 8 Deluxe](docs/images/mario-kart-8-deluxe.jpg)<br>Mario Kart 8 Deluxe<br><sub>IPA ~11.9 GB · update 4.0.0 · Mii heads not drawn (no firmware)</sub> | |
 
 ## Pack an IPA
 
@@ -51,18 +57,20 @@ Needs iOS / iPadOS 26 or later on an iPhone 15 Pro or newer (A17 Pro chip or lat
 
 ```
 git clone https://github.com/seedds/nxnative.git && cd nxnative
-brew install xcodegen zstd spirv-cross
+brew install xcodegen zstd spirv-cross glslang
 brew install --cask dotnet-sdk
 python3 -m pip install lz4 capstone fonttools "backports.zstd; python_version < '3.14'"
 ```
 
-**2. Put one game's NSPs in a folder**, base game (an NSP, or an XCI cartridge dump) and update (and any DLC):
+**2. Put one game's NSPs in a folder**: the base game (an NSP, or an XCI cartridge dump), plus its update and DLC if you have them:
 
 ```
 ~/Games/MarioWonder/
   Super Mario Bros. Wonder [010015100B514000][v0].nsp
   Super Mario Bros. Wonder [010015100B514800][v327680].nsp
 ```
+
+Any version works, with or without an update: the script packs the newest version in the folder. DLC is optional too: the DLC in the folder is packed, and without it the game sees none, as on a Switch without it. Each game was tested on one version (an update named in the table above is the one its 60 fps needs). With another version the script builds the game with that version's own shaders and says that the version was not tested; fixes made for the tested version's code, such as the 60 fps ones, don't apply to it.
 
 **3. Run the script:**
 
@@ -74,18 +82,22 @@ The IPA appears in the same folder (here `~/Games/MarioWonder/SMBWMobile.ipa`). 
 
 **4. Install** the IPA with your sideloading tool (AltStore, Sideloadly, LiveContainer, …). The app gets the game's name, icon and version (the update's version, for example 1.2.1 for Mario Wonder; the base game's when there is no update). Sign it with the **Increased Memory Limit** capability (`com.apple.developer.kernel.increased-memory-limit`) if your tool can: without it iOS gives the app about 3.4 GB and closes the bigger games (Hyrule Warriors: Age of Calamity and Hades II use more, Breath of the Wild and Cuphead come close); with it a recent iPhone gives about 6 GB.
 
+With an Apple developer account you can instead build and install from Xcode: `--prepare-xcode` makes an Xcode project for the game rather than an IPA ([Build and run on a device with Xcode](docs/development.md#build-and-run-on-a-device-with-xcode)).
+
 ## Play
 
-**Touch controls.** Tap **2D** / **3D** at the top to switch layouts; the app remembers your choice. Wonder, Engage, Dread, 13 Sentinels, Link's Awakening, Ace Attorney Investigations Collection, Unicorn Overlord, Rhythm Heaven Groove, Octopath Traveler 0, Pokémon Legends: Z-A, Cuphead, Absolum, Brain Memory Training Academy, The Great Ace Attorney Chronicles, STEINS;GATE RE:BOOT, Big Brain Academy: Brain vs. Brain, Patrick's Parabox and Celeste start in 2D, the other games in 3D (STEINS;GATE RE:BOOT's quick save is R3, in the 3D layout). In 3D, the right stick (the camera in most games) is not drawn: swipe on the right third of the screen, starting anywhere off the buttons. In Super Mario Galaxy and Super Mario Galaxy 2, other touches outside the controls move the pointer; in Captain Toad: Treasure Tracker they touch the game's screen (touch blocks, stun enemies), and in Big Brain Academy: Brain vs. Brain too (its menus and activities).
+**Settings.** A screen before the game starts offers what the game supports: frame rate, render scale, docked or handheld mode, game language, the frame-rate counter and Apple's performance HUD. Tap **Play** to start; the app remembers your choices.
+
+**Touch controls.** Tap **2D** / **3D** at the top to switch layouts; the app remembers your choice. Wonder, Engage, Dread, 13 Sentinels, Link's Awakening, Ace Attorney Investigations Collection, Unicorn Overlord, Rhythm Heaven Groove, Octopath Traveler 0, Pokémon Legends: Z-A, Cuphead, Absolum, Brain Memory Training Academy, The Great Ace Attorney Chronicles, STEINS;GATE RE:BOOT, Big Brain Academy: Brain vs. Brain, Patrick's Parabox, Celeste and Raging Loop start in 2D, the other games in 3D (STEINS;GATE RE:BOOT's quick save is R3, in the 3D layout). In 3D, the right stick (the camera in most games) is not drawn: swipe on the right third of the screen, starting anywhere off the buttons. In Super Mario Galaxy and Super Mario Galaxy 2, other touches outside the controls move the pointer; in Captain Toad: Treasure Tracker they touch the game's screen (touch blocks, stun enemies), and in Big Brain Academy: Brain vs. Brain too (its menus and activities).
 A connected game controller hides the touch controls and keeps every button.
 
 **Shaking.** Shake the iPhone to shake the controller, in games that read its motion: Super Mario Odyssey's motion moves (such as the cap throw on a shake) need it, and Odyssey only takes them in its default docked mode. A light bump does not count; a sharp flick of the phone does.
 
-- **Game language** is English by default. Pick another when packing with `--language` (`-l`), by code or by name: `-l ja`, `-l zh-Hans`, `-l French` (`LANGUAGE` in Spyder). It must be one the game has; the script prints the game's languages and stops on one it lacks. To change it without rebuilding, add a line such as `DM_LANG=zh-Hans` to `Documents/env.txt`.
+- **Game language** is English by default. Pick another when packing with `--language` (`-l`), by code or by name: `-l ja`, `-l zh-Hans`, `-l French` (`LANGUAGE` in Spyder). It must be one the game has; the script prints the game's languages and stops on one it lacks. To change it without rebuilding, pick another on the settings screen.
 - **Saves and logs** are in the Files app, under the app's name: `save/` and `log.txt`. When something goes wrong, send `log.txt` (the previous run is `log.prev.txt`).
 - **Short stutters** the first time a new scene appears are normal: the app compiles graphics for it once and remembers them for the next launch.
 - **Reinstalling:** some sideloading tools give a reinstalled app a new data folder. Copy `save/` and `pso_user.tsv` over from the old one to keep your progress.
-- **Settings without rebuilding:** put lines like `DM_OPMODE=0` (handheld mode: lower resolution, higher frame rate) in `Documents/env.txt`. `DM_FPS_TARGET=30` keeps Breath of the Wild, Tears of the Kingdom and Octopath Traveler 0 at their original 30 fps, which saves battery; `DM_PRESENT_INTERVAL=game` does the same for Monster Train 2. `DM_SHOW_FPS=1` shows the frame rate at the top left (`--show-fps` when packing turns it on from the start).
+- **Settings in a file:** lines like `DM_OPMODE=0` (handheld mode: lower resolution, higher frame rate) in `Documents/env.txt` win over the settings screen, which then shows them greyed out. `DM_FPS_TARGET=30` keeps Breath of the Wild, Tears of the Kingdom and Octopath Traveler 0 at their original 30 fps, which saves battery; `DM_PRESENT_INTERVAL=game` does the same for Monster Train 2. `DM_SHOW_FPS=1` shows the frame rate at the top left (`--show-fps` when packing turns it on from the start). `DM_LAUNCHER=0` skips the settings screen.
 
 ## Known issues
 

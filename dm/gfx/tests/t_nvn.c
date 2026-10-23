@@ -124,6 +124,39 @@ int main(void) {
         P(nvnTextureFinalize)(&original); P(nvnTextureFinalize)(&replacement);
     }
 
+    // Flushed ranges (nvn_flushed): a texture's storage flushed before its first use is filled from memory (tex_init_fill). Spans merge when they overlap or touch, and go with their pool
+    {
+        P(nvnMemoryPoolFlushMappedRange)(&pool, 0x1000, 0x100);
+        EXPECT("flushed: the flushed range", 1, nvn_flushed(poolmem + 0x1000, 0x100));
+        EXPECT("flushed: its last byte", 1, nvn_flushed(poolmem + 0x10ff, 1));
+        EXPECT("flushed: a range ending at its start", 0, nvn_flushed(poolmem + 0xf00, 0x100));
+        EXPECT("flushed: a range starting at its end", 0, nvn_flushed(poolmem + 0x1100, 0x100));
+        P(nvnMemoryPoolFlushMappedRange)(&pool, 0x1100, 0x100);
+        EXPECT("flushed: a touching flush merges (1 span)", 1, (long long)g_nfl);
+        P(nvnMemoryPoolFlushMappedRange)(&pool, 0x3000, 0x10);
+        EXPECT("flushed: a separate flush (2 spans)", 2, (long long)g_nfl);
+        EXPECT("flushed: the gap between them", 0, nvn_flushed(poolmem + 0x1200, 0x1e00));
+        P(nvnMemoryPoolFlushMappedRange)(&pool, 0x1080, 0x40);
+        EXPECT("flushed: a flush inside a span (still 2)", 2, (long long)g_nfl);
+        P(nvnMemoryPoolFlushMappedRange)(&pool, 0, 0x4000);
+        EXPECT("flushed: a flush over both (1 span)", 1, (long long)g_nfl);
+        fl_drop(poolmem + 0x1000, 0x1000);   // a pool inside the span: split
+        EXPECT("flushed: a pool dropped from inside a span (2 spans)", 2, (long long)g_nfl);
+        EXPECT("flushed: the dropped part", 0, nvn_flushed(poolmem + 0x1000, 0x1000));
+        EXPECT("flushed: before it", 1, nvn_flushed(poolmem + 0xfff, 1));
+        EXPECT("flushed: after it", 1, nvn_flushed(poolmem + 0x2000, 1));
+        static uint8_t smem[0x2000] __attribute__((aligned(4096))); NVNmemoryPool sp;
+        P(nvnMemoryPoolBuilderSetStorage)(&pb, smem, sizeof smem);
+        P(nvnMemoryPoolInitialize)(&sp, &pb);
+        P(nvnMemoryPoolFlushMappedRange)(&sp, 0x800, 0x800);
+        EXPECT("flushed: a second pool's flush", 1, nvn_flushed(smem + 0x800, 1));
+        P(nvnMemoryPoolFinalize)(&sp);
+        EXPECT("flushed: gone with its pool", 0, nvn_flushed(smem, sizeof smem));
+        fl_drop(poolmem, sizeof poolmem);
+        EXPECT("flushed: the first pool's spans dropped", 0, (long long)g_nfl);
+        P(nvnMemoryPoolBuilderSetStorage)(&pb, poolmem, sizeof poolmem);
+    }
+
     // 5. Command buffer: record uniform updates / events / counters / buffer copies / nested calls, with memory in 256 B segments to force multi-segment linking
     NVNcommandBuffer cb; P(nvnCommandBufferInitialize)(&cb, &dev);
     NVNmemoryPoolBuilder cpb; P(nvnMemoryPoolBuilderSetDefaults)(&cpb); P(nvnMemoryPoolBuilderSetStorage)(&cpb, g_cmdmem, sizeof g_cmdmem);
@@ -196,7 +229,57 @@ int main(void) {
         P(nvnCommandBufferEndRecording)(&c2);
         memcpy(&rh, m, sizeof rh); d = draw_idx_rec(m + 8, rh.size, &dt);
         EXPECT("indirect draw keeps its address", 0x20000, d->ind);
+        // A single texture bind keeps its handle 16 bytes into the command, where a game that patches recorded commands writes a new one (Luigi's Mansion 3: base + GetCommandMemoryUsed + 0x10)
+        P(nvnCommandBufferAddCommandMemory)(&c2, &mp, 0, sizeof m); P(nvnCommandBufferBeginRecording)(&c2);
+        size_t at = P(nvnCommandBufferGetCommandMemoryUsed)(&c2);
+        P(nvnCommandBufferBindTexture)(&c2, NVN_SHADER_STAGE_FRAGMENT, 3, (NVNtextureHandle)(0x1ff00000u | 1234));
+        P(nvnCommandBufferEndRecording)(&c2);
+        EXPECT("single texture bind recording: 0x20 + END", 0x28, P(nvnCommandBufferGetCommandMemoryUsed)(&c2));
+        uint32_t patched = 0x1ff00000u | 1235; memcpy(m + at + 0x10, &patched, 4);
+        memcpy(&rh, m, sizeof rh); p_bind_handles bt; const p_bind_handles *bh = bind_rec(rh.op, m + 8, &bt);
+        EXPECT("the bind reads the handle patched at its start + 0x10: slot 3, texture 1235, sampler 511", 1, rh.op == OP_BIND_TEX1 && bh->n == 1 && bh->first == 3 && bh->stage == NVN_SHADER_STAGE_FRAGMENT && bh->h[0] == patched);
         P(nvnCommandBufferFinalize)(&c2); P(nvnMemoryPoolFinalize)(&mp);
+    }
+    // 5b'. Fixed slots sized by GetCommandMemoryUsed, as Tears of the Kingdom gives each model's prerecorded lists (GitHub issue #61): a list measured at S bytes is recorded
+    //      into slot k = base + S × k with AddCommandMemory(max(S, 512)), and slot k + 1 is recorded right after it. The list here is an uniform update of n bytes and a
+    //      uniform buffer bind (the last record before the END in the crash), the next slot's starts with a CALL. Walking slot 0 afterwards must reach its own END through
+    //      its two records; with 24 bytes kept for a JUMP or an END, S = 496 put its END in a host segment and the JUMP at 488 had its target overwritten by that CALL
+    {
+        static uint8_t m[8192] __attribute__((aligned(4096))); NVNmemoryPoolBuilder mb; NVNmemoryPool mp; NVNcommandBuffer c3;
+        P(nvnMemoryPoolBuilderSetDefaults)(&mb); P(nvnMemoryPoolBuilderSetStorage)(&mb, m, sizeof m); P(nvnMemoryPoolInitialize)(&mp, &mb);
+        P(nvnCommandBufferInitialize)(&c3, &dev);
+        static uint8_t ub[1024]; NVNcommandHandle other = (NVNcommandHandle)m;   // the CALL's target is never followed here
+        int broken = 0, jumps_fit = 0, first_bad = -1;
+        for (int n = 0; n <= 1000; n += 8) {
+            P(nvnCommandBufferAddCommandMemory)(&c3, &mp, 0, sizeof m); P(nvnCommandBufferBeginRecording)(&c3);   // measure, in ample memory
+            P(nvnCommandBufferUpdateUniformBuffer)(&c3, 0x10000, 0x1000, 0, (size_t)n, ub); P(nvnCommandBufferBindUniformBuffer)(&c3, NVN_SHADER_STAGE_FRAGMENT, 4, 0x20000, 0x100);
+            P(nvnCommandBufferEndRecording)(&c3);
+            size_t S = P(nvnCommandBufferGetCommandMemoryUsed)(&c3), give = S > 512 ? S : 512;
+            memset(m, 0, sizeof m);
+            P(nvnCommandBufferAddCommandMemory)(&c3, &mp, 0, give); P(nvnCommandBufferBeginRecording)(&c3);
+            P(nvnCommandBufferUpdateUniformBuffer)(&c3, 0x10000, 0x1000, 0, (size_t)n, ub); P(nvnCommandBufferBindUniformBuffer)(&c3, NVN_SHADER_STAGE_FRAGMENT, 4, 0x20000, 0x100);
+            const uint8_t *h0 = (const uint8_t *)P(nvnCommandBufferEndRecording)(&c3);
+            P(nvnCommandBufferAddCommandMemory)(&c3, &mp, (ptrdiff_t)S, give); P(nvnCommandBufferBeginRecording)(&c3);   // the next slot, right behind
+            P(nvnCommandBufferCallCommands)(&c3, 1, &other); P(nvnCommandBufferEndRecording)(&c3);
+            // walk slot 0 as mtl_exec does: JUMP targets must be in the pool or a host segment
+            const uint8_t *p = h0; int ops[4], k = 0, jumped = 0, ok = 1;
+            for (int guard = 0; guard < 8; guard++) {
+                op_hdr h; memcpy(&h, p, sizeof h);
+                if (h.op == OP_JUMP) { const uint8_t *t; memcpy(&t, p + 8, 8); int in = t >= m && t < m + sizeof m;
+                    for (int i = 0; i < g_nhostseg; i++) in |= t >= g_hostseg[i].mem && t < g_hostseg[i].mem + HOSTSEG_SZ;
+                    if (!in) { ok = 0; break; } jumped = 1; p = t; continue; }
+                if (k < 4) ops[k] = (int)h.op; k++;
+                if (h.op == OP_END) break;
+                p += h.size;
+            }
+            ok &= k == 3 && ops[0] == OP_UPDATE_UB && ops[1] == OP_BIND_UBO && ops[2] == OP_END;
+            if (!ok) { broken++; if (first_bad < 0) first_bad = (int)S; }
+            jumps_fit += !jumped && S <= 504;   // fits in its 512 bytes with a JUMP's room to spare after its last record: stays in its slot
+        }
+        printf("(first broken slot size %d)\n", first_bad);
+        EXPECT("slotted lists replay whole after the next slot is recorded", 0, broken);
+        EXPECT("lists of 64..504 bytes stay in their 512 (no host segment)", (504 - 64) / 8 + 1, jumps_fit);
+        P(nvnCommandBufferFinalize)(&c3); P(nvnMemoryPoolFinalize)(&mp);
     }
 
     // 5b. Sync must hold the CPU back: first queue 24 copies of 64 MiB to keep the GPU busy, with the last one copying src to dst;

@@ -5,6 +5,8 @@
 #   mrs tpidr_el0       → read thread slot KTLS; msr tpidr_el0 → write KTLS
 #   mrs tpidrro_el0     → read thread slot KTLR (Horizon ThreadLocalRegion pointer)
 #   svc #n, mrs cntpct_el0 → host gate (gate address taken from thread slot KGATE; once in C, gates.tsv is looked up by return point)
+#   sub sp, sp, xN      → xN rounded up to 16 first (Apple's kernel faults on a misaligned sp, Horizon does not; site_sp_align)
+#   spin wait loops     → a copy whose back-edges pass a spin gate (the host yields there; a busy poll costs nothing on the Switch, see "Spin waits")
 #   Registered cuts (CUTS, restricted by NSO build ID): before rewriting, the original bytes are asserted one by one and any mismatch aborts; results are listed in <name>.cuts.tsv
 #   Registered observation gates (OBS, restricted by build ID): one instruction at the entry is replaced with "enter the host observation callback → execute the original instruction → jump back", so diagnostics modify zero code at runtime; listed in <name>.obs.tsv
 # The key page only stores "actual key number × 8" at the end of the data segment, and patch code fetches thread slots indirectly through the key page: the loader may use any key number.
@@ -13,6 +15,7 @@ import struct, re, sys, os
 from itertools import combinations
 import lz4.block
 from capstone import *
+from capstone.arm64 import ARM64_OP_IMM, ARM64_OP_MEM, ARM64_OP_REG
 
 src, outdir, NAME = sys.argv[1], sys.argv[2], sys.argv[3]
 d = open(src, 'rb').read()
@@ -121,11 +124,36 @@ CUTS = {
     (0x37c3b0, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
     (0x37c44c, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
   ],
+  # AI: THE SOMNIUM FILES - nirvanA Initiative 1.0.2 (v131072) sdk (SDK 13.3.5, Unity 2020.3.30f1): the same node area cut. nninitStartup (main+0x493300) calls
+  # StandardAllocator::Initialize(nullptr, pool − used) with virtual address memory, as Patrick's Parabox. The constructor is at sdk+0x37c130 (limit = alias start + 0x3fe00000 at +0x28,
+  # a unit heap of 0x30-byte nodes, the area then registered as occupied at +0x37c1dc)
+  '3644a6760469451cabc99f00c540acc2': [
+    (0x37c140, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
+    (0x37c1dc, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
+  ],
   # Pokémon Legends: Z-A 2.0.2 (v393216) sdk (SDK 19.3.11): the same node area cut. The constructor is at sdk+0x1423ec (limit = alias start + 0x3fe00000 at +0x28, a unit heap of 0x30-byte
   # nodes, the area then registered as occupied at +0x142468). With main's allocator region below, the guest block fits the 5 GB proven on a phone
   'df7a3960c74c3a4803f826c587153252': [
     (0x1423fc, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
     (0x142468, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
+  ],
+  # Hollow Knight: Silksong 1.0.30000 (v655360) sdk (SDK 20.5.8, Unity 6000.0.50f1): the same node area cut. Unity 6 takes all its memory itself through nn::os::AllocateAddressRegion and
+  # AllocateMemoryPages (no heap, no StandardAllocator in nninitStartup), and without the cut its regions start after the node area: the alias region's high-water mark was +1.00 GB at
+  # nninitStartup and +3.00 GB in the first room of play, with 1.51 GB mapped. The constructor is at sdk+0x145bec (limit = alias start + 0x3fe00000 at +0x28, a unit heap of 0x30-byte
+  # nodes, the area then registered as occupied at +0x145c68)
+  'e01950c58e17b080c90494784ea1dd29': [
+    (0x145bfc, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
+    (0x145c68, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
+  ],
+  # SDK 20.5.22 sdk (The Legend of Zelda: Tears of the Kingdom 1.4.3 and Breath of the Wild 1.9.0, the same build): the same node area cut. Tears of the Kingdom's resource heaps live in
+  # address regions after the node area. At the first descent from the Great Sky Island the alias region's high-water mark was +2.25 GB of its 2.375 GB with 1.00 GB mapped, and the game then
+  # took a memory shortage: its frame check (main+0x1fd32ec) logs MSF / R / Rf and plays the memory-shortage Blood Moon, which puts Link back at the start (GitHub issue #70; 7 of 8 Mac runs from
+  # the issue's save). With an 8 GB alias region the mark went on to +2.50 GB, with this cut it stays at +1.75 GB, and neither showed the shortage. The constructor is at sdk+0x145cfc
+  # (limit = alias start + 0x3fe00000 at +0x28, a unit heap of 0x30-byte nodes, the area then registered as occupied at +0x145d78); VammManager::AllocateAddressRegion (sdk+0x145df0) aligns
+  # regions to 64 KB or 2 MB only, so no alignment cut is needed
+  '574284b40c06cf1821a44857939083be': [
+    (0x145d0c, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
+    (0x145d78, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
   ],
   # Super Mario Galaxy 1.3.1 / Super Mario Galaxy 2 1.4.0 sdk (SDK 18.3.5, the same build in both): the same node area cut. Galaxy 2's movie player initializes its StandardAllocator with
   # virtual address memory (main+0x62c280: Initialize(nullptr, 384 MB)), which aborted at its CentralHeap::Init: a 256 MB alias region holds no region after a 1 GB node area.
@@ -155,6 +183,25 @@ CUTS = {
   # its largest block is nninitStartup's own probe of pool − used (3.15 GB, allocated and freed at once), so 4 GB of address space holds it
   'b1f12fd919eae86ab8a978317677e64b': [
     (0x1b3e3e4, '6200c0d2', '2200c0d2', 'StandardAllocator::Initialize(nullptr, size): address space mov x2,#0x300000000 → mov x2,#0x100000000 (12 GB → 4 GB)'),
+  ],
+  # SDK 15.3.2 sdk 8618895246b4 (Paper Mario: The Thousand-Year Door 1.0.1, Celeste 1.4.1.1; Celeste has no virtual address memory and never makes an address region): Absolum's cuts on this
+  # build. The AddressRegionManager constructor is at sdk+0x12e0e0 (node area limit at +0x12e0f0, registered as occupied at +0x12e184) and VammManager::AllocateAddressRegion at sdk+0x12e1d0
+  # aligns regions of 1 GB and more to 1 GB (+0x12e2e0). Measured with a 64 GB alias region: Paper Mario's malloc region was placed at the next 1 GB boundary after the 1 GB node area, 0.69 GB further
+  '8618895246b420329b77746b960a66ab': [
+    (0x12e0f0, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
+    (0x12e184, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
+    (0x12e2e0, '0a00a852', '0a40a052', 'AllocateAddressRegion: alignment of regions of 1 GB and more mov w10,#0x40000000 → mov w10,#0x2000000 (32 MB, as from 32 MB up)'),
+  ],
+  # Paper Mario: The Thousand-Year Door 1.0.1 (v65536) main: nninitStartup (main+0x3136b8, the game's malloc) initializes its StandardAllocator with virtual address memory over 62 GB of
+  # address space (StandardAllocator::Initialize(nullptr, 0xf80000000, false), main+0x3136e8), which the Switch's 64 GB alias region holds and an iPhone's single 6 GB reservation cannot;
+  # it then cuts its 256 MB, 16 MB and 1 MB allocators out of it. The pool (3.2 GB) bounds what it maps, so 4 GB of address space, as Pokémon Legends: Z-A's, holds it
+  '0effe4af1dec3a7966b934d4a7c3d2bf': [
+    (0x3136e8, 'e21361b2', '2200c0d2', 'StandardAllocator::Initialize(nullptr, size): address space mov x2,#0xf80000000 → mov x2,#0x100000000 (62 GB → 4 GB)'),
+    # 60 fps (30 on the Switch). Every frame main+0x2e7750 measures the time since the last one (oe::GetProgramTotalActiveTime), rounds it to 60 Hz vsyncs and clamps it to [2, cap]
+    # (a step above cap + 10 counts as 2); the base clock (time object +0x20, main+0x2e753c) then advances by that step, the field and battle clocks by it times their scale, and game
+    # seconds by step / 60. Timers, fades, animation and the scripts' frame counts follow the clocks. With the floor at 2 a frame shown every vsync still stepped two vsyncs, and
+    # the game ran at double speed; with 1 the step is what really passed: 1 at 60 fps, 2 when a frame takes two vsyncs (and at the game's own 30 fps, as before)
+    (0x2e77a4, '49008052', '29008052', 'frame step floor in 60 Hz vsyncs: mov w9,#2 → mov w9,#1 (the game steps by the vsyncs that passed, down to one)'),
   ],
   # The Legend of Zelda: Link's Awakening 1.1.0 (v131072) main: the physics step (main+0x15730, main thread) rebuilds each world's PhysX completion task in place
   # (a PxLightCpuTask at world+0xc8) and passes it to simulate. A worker runs it (main+0x10ccf80: fetchResults, world+0x1d8 done = 1, notify, unlock) and then calls its
@@ -216,6 +263,33 @@ CUTS = {
   '9fe60a212cff9b9a3656ab63d4f882e5': [
     (0x12e40, '90310294', '1f2003d5', 'nninitStartup: bl 0x9f480 (FMallocBinned3 constructor, 37 GB of address space) → nop; the host allocator is in the object already (hle_uemalloc.c)'),
   ],
+  # DRAGON QUEST VII Reimagined 1.2.0 (v131072) main: Unreal Engine 4.27's FMallocBinned3 likewise takes 37 GB of the engine's address region (nninitStartup reserves 62 GB at main+0xe8a2c0
+  # unless -SwitchVirtualAddressSpaceSize= caps it; the allocator's pools are cut out of that region, so a capped region would starve them). Here the allocator is made on the first allocation,
+  # during the static constructors: GCreateMalloc (main+0x32758b0) mallocs 0x1c38 bytes, constructs them (main+0x32758dc → main+0x291714) and stores GMalloc (main+0x77767e0). The constructor
+  # call is cut, and observation gate OBS_UE_MALLOC (OBS below) puts the host allocator's vtable into the new object, which is still in x19 (dm/host/hle_uemalloc.c). No code outside the
+  # allocator's own reads its pools (the pool base main+0x7744770 is read only there) or calls its methods directly: every FMemory call goes through the vtable
+  'f7ec03e4cb9de3bd8319d4e899d2e9cc': [
+    (0x32758dc, '8e6f4097', '1f2003d5', 'GCreateMalloc: bl 0x291714 (FMallocBinned3 constructor, 37 GB of address space) → nop; the host allocator\'s vtable is put in at the gate after it (hle_uemalloc.c)'),
+  ],
+  # FINAL FANTASY RESONANCE 1.0.1 (v65536) main: Unreal Engine 5.6.1 constructs its FMallocBinned3 in place, as Octopath Traveler 0's: nninitStartup (main+0x13370) reserves the engine region
+  # (62 GB unless -SwitchVirtualAddressSpaceSize= caps it, main+0x137d0), then calls the constructor on main+0x77c6210 (bss; main+0x137f0 → main+0xae770), which reserves 38 GB of address space
+  # for its pools (main+0xae860). The call is cut; the host puts its allocator's vtable in the object before any guest code runs (hle_uemalloc.c). FPlatformMemory::BaseAllocator (main+0x13c64)
+  # returns the object and the thread-local storage allocator (main+0x13830 / main+0x13870) calls its Malloc / Free slots; its pool base (main+0x7c148a0) and page size (main+0x7c14800)
+  # are read only by the allocator's own code (main+0xae024 to main+0xb4568)
+  '84e182f72ee1da4f477804bd05b54c15': [
+    (0x137f0, 'e06b0294', '1f2003d5', 'nninitStartup: bl 0xae770 (FMallocBinned3 constructor, 38 GB of address space) → nop; the host allocator is in the object already (hle_uemalloc.c)'),
+  ],
+  # FINAL FANTASY RESONANCE 1.0.1 (v65536) sdk (SDK 20.5.17, the build STEINS;GATE RE:BOOT runs, which has no virtual address memory): the AddressRegionManager node area cut, as on the other
+  # Unreal games' SDKs. The constructor is at sdk+0x145cac: +0x145cbc sets the node area limit, +0x145d28 registers it as an occupied region
+  '0023a1b06130cd795f7bc4613772af0a': [
+    (0x145cbc, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
+    (0x145d28, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
+  ],
+  # DRAGON QUEST VII Reimagined 1.2.0 (v131072) sdk (SDK 19.3.1): the same AddressRegionManager constructor as Octopath Traveler 0's SDK 19.3.13 build below, at the same offsets
+  '145dde94fb574acc9e09780a11995bd3': [
+    (0x1423fc, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
+    (0x142468, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
+  ],
   # DRAGON QUEST XI S 1.0.4 (v262144) sdk (SDK 7.3.2, the same build as Super Mario Odyssey 1.4.1's, which has no virtual address memory and never allocates an address region): the node
   # area cut, and regions of 1 GB and more aligned to 32 MB, as Absolum's. Unreal Engine 4.18's nninitStartup takes one region for the whole engine, which a NumberLineAllocator
   # (main+0x177c4d0) hands out (16 GB by default, -SwitchVirtualAddressSpaceSize= in MB caps it: the profile's game_args); the 1 GB alignment would have put it 1 GB into the alias region.
@@ -244,6 +318,16 @@ CUTS = {
     (0x12554, '000040f9', '000400f9', 'job pool wake: ldr x0,[x0] → str x0,[x0,#8] (pending = nonzero: the woken worker signals once more)'),
     (0x12558, '36fc1814', 'fdffff17', 'job pool wake: b SignalEvent → b 0x1254c (ldr x0,[x0]; b SignalEvent)'),
   ],
+  # Dark Souls Remastered 1.0.3 (v196608) main: 60 fps (30 on the Switch). The game presents at interval 1; its render thread (HGCommandDispatcher, main+0x8a4b28) ends each frame in a CPU limiter,
+  # main+0x707090(this, fps): 1000 / fps ms less the time since its last call (nn::os::GetSystemTick), slept out when more than 2 ms are left; the main thread waits for the render thread.
+  # The 30 is a constant at the only call (main+0x706fa4). The game does not step by the time that passed: the main thread's frame update (main+0x6a337c, on the manager at GOT 0x2287be0)
+  # takes a fixed step, the float 1/30 at main+0x167a6ec loaded at main+0x667904, so at 60 fps everything ran twice as fast (on the iPhone). The step loads the 1/60 that rodata holds at
+  # main+0x167a834 instead (as the community's 60 fps cheat for this build does). Climbing ladders still misplays at 60 (known with that cheat too). The limiter's frame-skip mode only starts
+  # above 36.4 ms a frame, so 60 does not reach it
+  'df3766a2bb651a3e822828abf10b6f7b': [
+    (0x706fa4, 'e10f1f32', '81078052', 'frame limiter target: mov w1,#30 → mov w1,#60 (main+0x707090 sleeps out 1000 / fps ms since the last frame)'),
+    (0x667904, '08ed46bd', '083548bd', 'frame update step: ldr s8,[x8,#0x6ec] (1/30) → ldr s8,[x8,#0x834] (1/60), passed to main+0x6a337c'),
+  ],
 }
 # ---- Registered observation gates: {NSO build ID: [(offset, number, original instruction word, reason)]}. Numbers match OBS_* in the host's hle.h;
 # the original instruction must be position independent (no PC-relative / branch / anything involving x18 or tpidr), asserted offline; when the host has no callback attached the gate block goes in and out once and returns ----
@@ -253,6 +337,10 @@ OBS = {
   '646761f643afebb379edd5e6a5151af2': [
     (0x2247a4, 19, '910022d6', 'link request posted (loop at main+0x224728, x19 = request ring): wait for the dispatcher; orig add x22, x22, #8'),
     (0x2248e4, 20, '910022d6', 'unlink request posted (loop at main+0x224868, x19 = request ring): wait for the dispatcher before the object is freed; orig add x22, x22, #8'),
+  ],
+  # DRAGON QUEST VII Reimagined 1.2.0 main: right after the cut FMallocBinned3 constructor call (CUTS above), x19 = the new allocator object; the host writes its vtable there (hle_uemalloc.c)
+  'f7ec03e4cb9de3bd8319d4e899d2e9cc': [
+    (0x32758e4, 21, 'aa1303e0','GCreateMalloc: the allocator object is in x19, before it is used: the host puts its vtable in; orig mov x0, x19'),
   ],
 }
 BUILD_ID = d[0x40:0x50].hex()
@@ -370,6 +458,16 @@ def site_sp(ins):
     emit(ADDI(T, 31, 0))             # mov T, sp (in add immediate, 31 is sp)
     emit(subst(ins, S))
     emit(LDP(S, T, T, -16)); emit(B(here(), ins.address + 4))
+    return start
+
+def site_sp_align(ins, n):
+    """sub sp, sp, xN (no shift): Horizon leaves stack alignment checking off for user code, Apple's kernel does not, so an sp that is not 16-byte aligned faults (SIGBUS) at the next sp-based access.
+    Paper Mario: The Thousand-Year Door's script call bridges (main+0x17c140 and five more beside it, hand-written) reserve the callee's stack arguments as their sizes add up (4 for one int)
+    and give the area back with add sp, sp, xN: the callee's first stp faulted. xN is rounded up to 16 first, which the add then gives back too. Compiled code keeps such sizes 16-aligned, so
+    there it changes nothing; of the 22 games' modules on hand only Paper Mario's main has the form"""
+    start = here()
+    emit(ADDI(n, n, 15)); emit(0x927CEC00 | n << 5 | n)   # add xN, xN, #15; and xN, xN, #~15
+    emit(struct.unpack('<I', ins.bytes)[0]); emit(B(here(), ins.address + 4))
     return start
 
 def site_cond(ins):
@@ -636,9 +734,34 @@ starts = sorted(x for x in starts if x < TEXT_END)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import nso_code
 DATA_BLOCKS = nso_code.data_blocks(IMG, TEXT_END, md)
+CODE_RANGES = list(zip([0] + [e for _, e in DATA_BLOCKS], [s for s, _ in DATA_BLOCKS] + [TEXT_END]))
+md_lite = Cs(CS_ARCH_ARM64, CS_MODE_ARM)   # no details: the x18 scan reads only the operand text
+R18 = re.compile(r'\b[xw]18\b')
+def x18_words(lo, hi):
+    """offsets in [lo, hi) of the instructions whose operands name x18 / w18 (as has18). Decoded 16 KB at a time without details, going on after a word capstone cannot decode:
+    a third of the time of decoding one word at a time with details (Paper Mario: The Thousand-Year Door main, 437 sites in 300,000 words either way)"""
+    out, a = set(), lo
+    while a < hi:
+        end = min(hi, a + 0x4000); last = a - 4
+        for addr, size, mn, op in md_lite.disasm_lite(bytes(IMG[a:end]), a):
+            last = addr
+            if R18.search(op): out.add(addr)
+        a = last + 4 if last + 4 >= end else last + 8   # the chunk is done, or the word after the last decoded one is no instruction
+    return out
+x18 = set().union(*(x18_words(s, e) for s, e in CODE_RANGES))
 kinds = {}
-for o in (o for s, e in zip([0] + [e for _, e in DATA_BLOCKS], [s for s, _ in DATA_BLOCKS] + [TEXT_END]) for o in range(s, e, 4)):
+# Spin wait candidates (see "Spin waits" below): backward direct branches (b, b.cond, cbz / cbnz, tbz / tbnz) at most SPIN_WIN bytes back, by target
+SPIN_WIN, SPIN_TOPS = 512, {0x16, 0x17, 0x54, 0x34, 0x35, 0xB4, 0xB5, 0x36, 0x37, 0xB6, 0xB7}
+spin_cand = {}
+for o in (o for s, e in CODE_RANGES for o in range(s, e, 4)):
     w = struct.unpack_from('<I', IMG, o)[0]
+    if w >> 24 in SPIN_TOPS:
+        t = w >> 24
+        if t in (0x16, 0x17): d = ((w & 0x3FFFFFF) - (1 << 26)) * 4
+        elif t & 0x7E == 0x36: d = (((w >> 5) & 0x3FFF) - (1 << 14)) * 4 if w & 0x40000 else 4
+        elif t == 0x54: d = (((w >> 5) & 0x7FFFF) - (1 << 19)) * 4 if w & 0x800000 and not w & 0x10 else 4
+        else: d = (((w >> 5) & 0x7FFFF) - (1 << 19)) * 4 if w & 0x800000 else 4
+        if -SPIN_WIN <= d <= 0: spin_cand.setdefault(o + d, []).append(o)
     if w & 0xFFE0001F == 0xD4000001: kinds[o] = ('svc', (w >> 5) & 0xFFFF); continue
     if w & 0xFFFFFFE0 == 0xD53BD040: kinds[o] = ('tpidr_r', None); continue
     if w & 0xFFFFFFE0 == 0xD51BD040: kinds[o] = ('tpidr_w', None); continue
@@ -647,14 +770,20 @@ for o in (o for s, e in zip([0] + [e for _, e in DATA_BLOCKS], [s for s, _ in DA
     if w & 0xFFFFFFE0 == 0xD53BE040: kinds[o] = ('cntvct', w & 31); continue
     # mrs xN, ctr_el0 (cache type): the Apple kernel does not expose it to user mode (SIGILL); SDK 16's nn::os::FlushDataCache reads it for the cache line size
     if w & 0xFFFFFFE0 == 0xD53B0020: kinds[o] = ('ctr', w & 31); continue
-    for ins in md.disasm(IMG[o:o + 4], o):
-        if has18(ins): kinds[o] = ('x18', None)
+    # sub sp, sp, xN (extended register, LSL #0): sp may end up misaligned, which Horizon allows and Apple's kernel does not (site_sp_align); with x18 it is an x18 site (site_sp)
+    if w & 0xFFE0FFFF == 0xCB2063FF and (w >> 16) & 31 != 18: kinds[o] = ('sp_align', (w >> 16) & 31); continue
+    if o in x18: kinds[o] = ('x18', None)
 
 # Take the instruction table per function, find the windows and jump tables
 import bisect
 def func_of(a):
+    """The function holding a: from the FDE start at or before it to the next one. Code before the first FDE is one function as well, from the end of the data block before it (or the text's
+    start) to the first FDE: FINAL FANTASY RESONANCE 1.0.1 main (Unreal Engine 5.6.1) has no unwind entry before main+0x6a75d4, and each of its sites there used to be a function of one
+    instruction, so the byte jump table at main+0x219234 (adr x18; ldrb w0,[x17,x16]; add x18,x18,x0,lsl #2; br x18) was never seen. Of the 120 modules of 33 games on hand, only one other has x18
+    sites before its first FDE (DRAGON QUEST VII Reimagined main, 110 before +0xb310, none in an exclusive window or a br x18), so every other rewrite is byte-identical"""
     i = bisect.bisect_right(starts, a) - 1
-    return (starts[i], starts[i + 1] if i + 1 < len(starts) else TEXT_END) if i >= 0 else (a, a + 4)
+    if i >= 0: return (starts[i], starts[i + 1] if i + 1 < len(starts) else TEXT_END)
+    return (max((e for s, e in DATA_BLOCKS if e <= a), default=0), starts[0]) if starts else (a, a + 4)
 done = set(); windows = []; jumps = {}; tabjumps = {}; tailcalls = set(); retries = []
 def check_before_copy(insl, ctx, ld, idx):
     """The index copied from the checked register before the check, far back (DRAGON QUEST XI S main+0x2dd8cd0: mov w0,w18, then 41 instructions with two other jump tables on x0, then
@@ -676,13 +805,16 @@ def check_before_copy(insl, ctx, ld, idx):
         if writes(p) & (idx | {src}): return None
     else: return None
     return ctx[k - 2]
-def jump_offsets(insl, j, copy_first=False):
+def jump_offsets(insl, j, copy_first=False, far_base=False):
     """The br x18 is preceded by the offset-table form (Engage main+0x12eec94): cmp w18,#N; b.hi; ldrsw x18,[xB,x18,lsl #2]; add x18,x18,xB.
     The index may be another register, and the bounds check may be on a register copied into it: Link's Awakening's GLSLC (subsdk0+0x1be6e8) has
     sub w0,w18,#0xd1; cmp w0,#0x31; b.hi; ldrsw x18,[x17,x0,lsl #2], its movie module (subsdk1+0xae9a4) cmp w21,#7; b.hi; ...; mov w18,w21; ldrsw x18,[x4,x18,lsl #2].
     The entry may also be loaded into another register and only the add writes x18: Cuphead (Unity 2017.4, main+0x1bb872c) has cmp w17,#7; ldrsw x17,[x15,x17,lsl #2]; add x18,x17,x15
     (found by armyja, GitHub pull request #1).
-    For the table base xB, search back for the nearest writer: it must be add xB,xB,#lo, and the writer before it must be adrp xB. Returns all targets, or None if not recognized"""
+    For the table base xB, search back for the nearest writer: it must be add xB,xB,#lo, and the writer before it must be adrp xB. With far_base, a base that nothing writes in those
+    256 instructions was set further back, and its writer chain is followed to the function's start (table_base far), every target an instruction of the function: ASTRAL CHAIN main+0x6db498
+    and +0x6db70c load bases set 441 and 549 instructions before, x24 in the function's first block and x3 after it, which the loop around their dispatches keeps. A function-wide search
+    for the one adrp + add pair that fits (table_cands, as jump_adr_offsets does) finds two for x3 there, the other a table of its own further on. Returns all targets, or None if not recognized"""
     ctx = insl[max(0, j - 16):j]
     add = next((p for p in reversed(ctx) if p.mnemonic == 'add' and re.fullmatch(r'x18, x\d+, x\d+', p.op_str)), None)
     if not add: return None
@@ -723,13 +855,23 @@ def jump_offsets(insl, j, copy_first=False):
         if lo is None and p.mnemonic == 'add' and re.fullmatch(rf'{rb}, {rb}, #(0x[0-9a-f]+|\d+)', p.op_str): lo = int(p.op_str.split('#')[1], 0); continue
         if lo is not None and p.mnemonic == 'adrp' and p.op_str.startswith(rb + ','): page = p.operands[1].imm
         break
+    else:
+        if lo is None and far_base:   # nothing writes the base in the window
+            tb = table_base(insl, k, rb, far=True)
+            if tb is None or tb + 4 * n > len(IMG): return None
+            t = [tb + struct.unpack_from('<i', IMG, tb + 4 * i)[0] for i in range(n)]
+            fa, fb = insl[0].address, insl[-1].address + 4
+            return t if all(fa <= x < fb and x % 4 == 0 for x in t) else None
     if page is None: return None
     tb = page + lo
     return [tb + struct.unpack_from('<i', IMG, tb + 4 * i)[0] for i in range(n)]
-def table_base(insl, k, rb):
-    """Address the table-base register rb holds at insl[k]: its writer chain before k must be add rb,rb,#lo after adrp rb (as in jump_offsets); None otherwise"""
+def table_base(insl, k, rb, far=False):
+    """Address the table-base register rb holds at insl[k]: its writer chain before k must be add rb,rb,#lo after adrp rb (as in jump_offsets); None otherwise.
+    The chain is searched 256 instructions back, or with far to the function's start, through no call when rb is caller-saved (capstone lists only x30 as a call's write; a call between
+    means the code before it in address order is not the path that set rb)"""
     lo = None
-    for p in reversed(insl[max(0, k - 256):k]):
+    for p in reversed(insl[0 if far else max(0, k - 256):k]):
+        if far and p.mnemonic in ('bl', 'blr') and num(rb) <= 18: return None
         _, w = p.regs_access()
         if not any(p.reg_name(r) == rb for r in w): continue
         if lo is None and p.mnemonic == 'add' and re.fullmatch(rf'{rb}, {rb}, #(0x[0-9a-f]+|\d+)', p.op_str): lo = int(p.op_str.split('#')[1], 0); continue
@@ -763,15 +905,18 @@ def jump_adr_offsets(insl, j):
         # The base register was loaded further away (main+0x5f2a9c: hoisted out of the dispatch block): take every adrp + add pair in the function that builds it,
         # and accept the table only if exactly one candidate makes every target an instruction of this function
         fa, fb = insl[0].address, insl[-1].address + 4
-        cands = set()
-        for k, p in enumerate(insl):
-            if p.mnemonic != 'adrp' or not p.op_str.startswith(tb_reg + ','): continue
-            q = next((x for x in insl[k + 1:k + 9] if any(x.reg_name(r) == tb_reg for r in x.regs_access()[1])), None)
-            m = re.fullmatch(rf'{tb_reg}, {tb_reg}, #(0x[0-9a-f]+|\d+)', q.op_str) if q is not None and q.mnemonic == 'add' else None
-            if m: cands.add(p.operands[1].imm + int(m.group(1), 0))
-        ok = [tb for tb in sorted(cands) if (t := targets(tb)) and all(fa <= x < fb and x % 4 == 0 for x in t)]
+        ok = [tb for tb in table_cands(insl, tb_reg) if (t := targets(tb)) and all(fa <= x < fb and x % 4 == 0 for x in t)]
         return targets(ok[0]) if len(ok) == 1 else None
     return None
+def table_cands(insl, rb):
+    """Every address an adrp rb + add rb,rb,#lo pair in the function builds, sorted"""
+    cands = set()
+    for k, p in enumerate(insl):
+        if p.mnemonic != 'adrp' or not p.op_str.startswith(rb + ','): continue
+        q = next((x for x in insl[k + 1:k + 9] if any(x.reg_name(r) == rb for r in x.regs_access()[1])), None)
+        m = re.fullmatch(rf'{rb}, {rb}, #(0x[0-9a-f]+|\d+)', q.op_str) if q is not None and q.mnemonic == 'add' else None
+        if m: cands.add(p.operands[1].imm + int(m.group(1), 0))
+    return sorted(cands)
 def tail_call(insl, j):
     """The br x18 is an indirect tail call, not a jump table: the last write of x18 before it is a plain pointer load and the br ends the function. Ace Attorney Investigations Collection
     (Unity 2022.3 IL2CPP) main+0x1d271bc: ldr x18,[x0,#0x18]; ...; ldr x16,[sp]; ...; br x18, a thunk that moves stack arguments and jumps to the method pointer at +0x18"""
@@ -793,7 +938,35 @@ def jump_bytes_far(insl, j):
     base = next((q.operands[1].imm for q in reversed(ctx[:k]) if q.mnemonic == 'adr' and q.op_str.startswith('x18,')), None)
     ld = next((q for q in reversed(ctx[:k]) if q.mnemonic in ('ldrb', 'ldrsb', 'ldrh', 'ldrsh') and num(q.reg_name(q.operands[0].reg)) == idx), None)
     if base is None or ld is None: return None
-    return base, 256 if ld.mnemonic in ('ldrb', 'ldrsb') else 65536
+    return base, 256 if ld.mnemonic in ('ldrb', 'ldrsb') else half_count(insl, ld, base) or 65536
+def half_count(insl, ld, base):
+    """Landing pads a halfword table needs (ldrh wE,[xT,xI,lsl #1]; ...; adr x18,#L; add x18,x18,xE,lsl #2; br x18: target = L + 4 × entry). site_br gives every possible entry a pad,
+    65,536 of them (768 KB), whatever the switch's size: Animal Crossing: New Horizons 3.0.3 main has 51 such tables, 40 MB, which put its patch area's end beyond the ±128 MB a B reaches
+    (a B() assertion at its spin waits), and Tears of the Kingdom's main has 11. The table is read as jump_adr_offsets reads one: the index's bounds check (following register copies),
+    then the table base from adrp + add, or the one candidate in the function whose every target is an instruction of it → the largest entry + 1, or None (all 65,536, as before).
+    Byte tables keep their 256 pads (3 KB)"""
+    m = re.fullmatch(r'w\d+, \[(x\d+), [wx](\d+), (?:lsl|uxtw) #1\]', ld.op_str) if ld.mnemonic == 'ldrh' else None
+    if not m: return None
+    tb_reg, k = m.group(1), insl.index(ld)
+    idx, cmp = {'w' + m.group(2)}, None
+    for p in reversed(insl[max(0, k - 32):k]):   # walk back from the load to the bounds check
+        mm = re.fullmatch(r'(w\d+), (w\d+)', p.op_str) if p.mnemonic == 'mov' else None
+        if mm and mm.group(1) in idx: idx.add(mm.group(2)); continue
+        mm = re.fullmatch(r'(w\d+), #(0x[0-9a-f]+|\d+)', p.op_str) if p.mnemonic == 'cmp' else None
+        if mm and mm.group(1) in idx: cmp = p; break
+        if any('w' + p.reg_name(r)[1:] in idx for r in p.regs_access()[1]): return None   # the index changes after the check
+    kc = insl.index(cmp) if cmp is not None else -1
+    if kc < 0 or insl[kc + 1].mnemonic not in ('b.hi', 'b.hs', 'b.cs'): return None   # only a compare that guards the dispatch bounds the index (b.hs: one entry more than needed)
+    n = int(cmp.op_str.split('#')[1], 0) + 1
+    fa, fb = insl[0].address, insl[-1].address + 4
+    def entries(tb): return struct.unpack_from(f'<{n}H', IMG, tb) if 0 <= tb and tb + 2 * n <= len(IMG) else None
+    def fits(e): return e is not None and all(fa <= base + 4 * x < fb for x in e)
+    tb = table_base(insl, k, tb_reg)
+    if tb is None:
+        ok = [c for c in table_cands(insl, tb_reg) if fits(entries(c))]
+        tb = ok[0] if len(ok) == 1 else None
+    e = entries(tb) if tb is not None else None
+    return max(e) + 1 if fits(e) else None
 def disasm_fn(fa, fb):
     """A function's instructions. Capstone stops at the first word it cannot decode, so go on after it: Monster Hunter Rise main+0x6b34540 is a trap word (0xe7ffdefe)
     in the middle of a function, and the br x18 jump table after it (main+0x6b346d0) was never seen"""
@@ -802,7 +975,52 @@ def disasm_fn(fa, fb):
         l = list(md.disasm(bytes(IMG[a:fb]), a))
         out += l; a = (l[-1].address + 4 if l else a) + 4
     return out
+# Text with no unwind entry is one function to func_of. FINAL FANTASY RESONANCE 1.0.1 main (Unreal Engine 5.6.1) has 82 MB of it (main+0x6c5008 to +0x59220c0) beside the 6.65 MB before its
+# first FDE: disassembled with details at once, it took 100 GB of memory and the rewrite never finished on a 16 GB Mac. A function longer than BIG_FN is analysed in pieces of about PIECE
+# bytes, cut only right after an unconditional ret / br / b where no conditional branch and no b within ±PIECE_B crosses: a window, a jump table's context (the bounds check's branch
+# and the table base before it) and a retry block reach each other by fall-through or by such branches, so each lies within one piece. Farther b / bl that cross a cut (calls and
+# tail calls) are checked once every piece is done: none may land inside a window or a retry block (far_into). With b up to 1 MB counted, tail calls between neighbouring functions left
+# 21,385 cut points in that 82 MB and pieces of up to 6.5 MB (about 4 GB while disassembled); with 64 KB, 185,228 points and none over PIECE
+BIG_FN, PIECE, PIECE_B = 0x40000, 0x40000, 0x10000
+def pieces(fa, fb):
+    """[(start, end)] covering [fa, fb), and the far b / bl in it as [(site, target)]"""
+    from array import array
+    n = (fb - fa) // 4
+    w = memoryview(bytes(IMG[fa:fa + 4 * n])).cast('I')
+    cross = array('i', bytes(4 * (n + 2))); far = []
+    for i in range(n):
+        x = w[i]; t = x >> 24
+        if t == 0x54 and not x & 0x10 or t & 0x7E == 0x34: d = (x >> 5) & 0x7FFFF; d -= (d & 0x40000) << 1   # b.cond, cbz / cbnz
+        elif t & 0x7E == 0x36: d = (x >> 5) & 0x3FFF; d -= (d & 0x2000) << 1                                  # tbz / tbnz
+        elif t & 0x7C == 0x14:                                                                                # b, bl
+            d = x & 0x3FFFFFF; d -= (d & 0x2000000) << 1
+            if t & 0x80 or 4 * abs(d) > PIECE_B: far.append((fa + 4 * i, fa + 4 * (i + d))); continue
+        else: continue
+        lo, hi = max(min(i, i + d), -1), min(max(i, i + d), n)   # the branch crosses the cut before instruction k when lo < k <= hi
+        cross[lo + 1] += 1; cross[hi + 1] -= 1
+    cand, c = [], 0
+    for k in range(n):
+        c += cross[k]
+        x = w[k - 1] if k else 0
+        if k and not c and (x & 0xFFFFFC1F in (0xD65F0000, 0xD61F0000) or x >> 26 == 0x05): cand.append(k)   # after ret / br / b, nothing crossing
+    cuts, s = [], 0
+    while s + PIECE // 4 < n:
+        j = bisect.bisect_right(cand, s + PIECE // 4) - 1
+        if j < 0 or cand[j] <= s: j = bisect.bisect_right(cand, s + PIECE // 4)
+        if j >= len(cand): break
+        s = cand[j]; cuts.append(s)
+    b = [0] + cuts + [n]
+    return [(fa + 4 * p, fa + 4 * q) for p, q in zip(b, b[1:])], far
 funcs = sorted({func_of(a) for a, (k, _) in kinds.items() if k == 'x18'})
+far_into, rmid_all = [], set()
+if any(fb - fa > BIG_FN for fa, fb in funcs):
+    sites18 = sorted(a for a, (k, _) in kinds.items() if k == 'x18'); split = []
+    for fa, fb in funcs:
+        if fb - fa <= BIG_FN: split.append((fa, fb)); continue
+        ps, far = pieces(fa, fb); far_into += far
+        split += [(p, q) for p, q in ps if bisect.bisect_left(sites18, p) < bisect.bisect_left(sites18, q)]   # the pieces that hold x18 sites
+        print(f'function {fa:#x}..{fb:#x} ({(fb - fa) / 2**20:.2f} MB, no unwind entries) analysed in {len(ps)} pieces')
+    funcs = split
 for fa, fb in funcs:
     insl = disasm_fn(fa, fb)
     ws = find_windows(insl)
@@ -821,14 +1039,14 @@ for fa, fb in funcs:
                     rn = p.reg_name(p.operands[2].reg); idx = {'lr': 30, 'fp': 29}.get(rn, num(rn))
                     for q in reversed(ctx):
                         if q.mnemonic in ('ldrb', 'ldrsb') and num(q.reg_name(q.operands[0].reg)) == idx: width = 256
-                        if q.mnemonic in ('ldrh', 'ldrsh') and num(q.reg_name(q.operands[0].reg)) == idx: width = 65536
+                        if q.mnemonic in ('ldrh', 'ldrsh') and num(q.reg_name(q.operands[0].reg)) == idx: width = half_count(insl, q, base) or 65536 if base else 65536
                         if width: break
                     break
             if not (base and width):
                 tgt = jump_offsets(insl, j) or jump_adr_offsets(insl, j)
                 if not tgt and tail_call(insl, j): tailcalls.add(ins.address); continue
                 if not tgt and (far := jump_bytes_far(insl, j)): jumps[ins.address] = far; continue
-                if not tgt: tgt = jump_offsets(insl, j, copy_first=True)   # the index copied before the check (check_before_copy), only where every other form failed
+                if not tgt: tgt = jump_offsets(insl, j, copy_first=True, far_base=True)   # the index copied before the check (check_before_copy) or the base set far back, only where every other form failed
                 assert tgt, f'jump table {ins.address:x}'
                 tabjumps[ins.address] = tgt; continue
             jumps[ins.address] = (base, width)
@@ -850,6 +1068,11 @@ for fa, fb in funcs:
             assert x.operands[-1].imm not in rmid, f'branch into retry block {x.address:x}'
     for a_, tgt in tabjumps.items():
         if fa <= a_ < fb: assert not any(t in inwin and t not in heads for t in tgt), f'jump table target into window {a_:x}'
+    rmid_all |= rmid
+if far_into:   # functions analysed in pieces (pieces above): their far b / bl, and every jump table's targets (a cut may follow a br x18), may not land inside a window or a retry block
+    win_mid = {x.address for wseg in windows for x in wseg[1:]}
+    for at, to in far_into: assert to not in win_mid and to not in rmid_all, f'far branch into a window or retry block {at:x}'
+    for at, tgt in tabjumps.items(): assert not any(t in win_mid or t in rmid_all for t in tgt), f'jump table target into a window or retry block {at:x}'
 
 def put_branch(at, to): struct.pack_into('<I', IMG, at, B(at, to))
 for wseg in windows:
@@ -875,23 +1098,37 @@ for a in sorted(kinds):
     elif k == 'tpidr_w': st = site_tpidr_write(ins); stat(k)
     elif k == 'svc': st = site_gate(ins, 'svc', arg); stat(k)
     elif k in ('cntpct', 'cntvct'): st = site_gate(ins, k, arg); stat(k)
+    elif k == 'sp_align': st = site_sp_align(ins, arg); stat(k)
     elif k == 'ctr':   # replaced in place by a constant: DminLine = 4 (64-byte lines); movz xN, #4, lsl #16
         assert arg != 18, f'{a:x} mrs x18, ctr_el0'
         struct.pack_into('<I', IMG, a, 0xD2A00080 | arg); stat(k); continue
     put_branch(a, st)
+
+def scratch_dead(off):
+    """x9–x17 carry nothing at off: from off on, every one of them is written before it is read, up to a bl (a call clobbers them all; DRAGON QUEST VII Reimagined's gate sits on the
+    mov x0, x19 before one). Only straight-line code is followed: a branch, a blr or a ret before the bl answers no"""
+    written = set()
+    for a in range(off, min(off + 4 * 16, TEXT_END), 4):
+        ins = dis(struct.unpack_from('<I', IMG, a)[0], a)
+        if ins.mnemonic == 'bl': return True
+        if ins.mnemonic in ('b', 'br', 'blr', 'ret', 'cbz', 'cbnz', 'tbz', 'tbnz') or ins.mnemonic.startswith('b.'): return False
+        rd, wr = regset(ins)
+        if any(9 <= (num(r) or -1) <= 17 and num(r) not in written for r in rd): return False
+        written |= {num(r) for r in wr}
+    return False
 
 obs = list(OBS.get(BUILD_ID, []))
 for off, oid, ow, why in obs:
     w = struct.unpack_from('<I', IMG, off)[0]
     assert f'{w:08x}' == ow, f'observation gate original instruction mismatch {off:#x}: {w:08x}'
     # Function entries, or the instruction right after a bl, only: dm_gate writes back only x0–x8 / x30, and host C code may modify x9–x17; at entry these carry no values under AAPCS64 (arguments are only in x0–x7 / x8),
-    # and right after a call returns the callee was free to clobber them anyway (x16 / x17 are the veneer registers)
+    # and right after a call returns the callee was free to clobber them anyway (x16 / x17 are the veneer registers). Elsewhere, where the code ahead reads none of them before its next bl
     after_bl = off >= 4 and struct.unpack_from('<I', IMG, off - 4)[0] >> 26 == 0x25
-    assert off in set(starts) or after_bl, f'observation gate neither at a function entry nor after a bl {off:#x}'
+    assert off in set(starts) or after_bl or scratch_dead(off), f'observation gate neither at a function entry, after a bl nor before a call with x9–x17 unread {off:#x}'
     assert off < TEXT_END and off not in kinds and not any(lo <= off < hi for wseg in windows for lo, hi in [(wseg[0].address, wseg[-1].address + 4)]), f'observation gate conflicts with a rewrite site {off:#x}'
     put_branch(off, site_obs(off, oid, w)); stat('obs')
 
-# ---- Frame step in whole vsyncs (The Legend of Zelda: Tears of the Kingdom 1.4.3, Breath of the Wild 1.9.0 and Hyrule Warriors: Age of Calamity 1.3.0 main, host only) ----
+# ---- Frame step in whole vsyncs (The Legend of Zelda: Tears of the Kingdom 1.4.3, Breath of the Wild 1.9.0, Hyrule Warriors: Age of Calamity 1.3.0 and Paper Mario: The Thousand-Year Door 1.0.1 main, host only) ----
 # The games step their game time by a whole number of vsyncs (1/60 s) per frame that their own interval logic picks. With the stubs the host picks it (hle_nvn.c fstep_tick,
 # nvn_fstep.h): the step is the number of vsyncs the host keeps the frame on screen (1 = 60 fps, 2 = 30 when 60 does not hold), plus one while the game is behind real time after
 # a late frame, so motion is even and game time = real time. The steps stay values the games' own logic uses (1 to 3). Age of Calamity's updates are not held by the presents:
@@ -900,8 +1137,9 @@ for off, oid, ow, why in obs:
 # runs the original instructions), +4 TOTK movie flag, +8 double lead (TOTK, below), +0x10 float render scale (TOTK, below), +0x18 double game seconds (TOTK, below),
 # +0x20 u32 step in vsyncs (host; 0 = not decided yet), +0x24 u32 a step the game fixes itself (BotW's VFR override; 0 = none), +0x28 u32 AoC's vsyncs per update, marked by
 # its first stub (0 = off), +0x30 u64 vsyncs stepped (the stubs; logged by the host to check the game's speed). Stub bodies assembled with clang
-FRAME_STEP = {'277178b7dba1b6d4949a84778d4abc58', 'cd57b23fa4bbad65803d9788c01821ee', 'c3cf52bf2b05d7310884971b50bcccb8'}
+FRAME_STEP = {'277178b7dba1b6d4949a84778d4abc58', 'cd57b23fa4bbad65803d9788c01821ee', 'c3cf52bf2b05d7310884971b50bcccb8', '0effe4af1dec3a7966b934d4a7c3d2bf'}
 FS_STATE_OFF = 0
+RENDER_SCALE = 0   # 1 = the build has a render-scale stub (state +0x10): the fixups table says so (RENDER_SCALE), and the iOS launcher offers the setting (dm/games/settings.tsv)
 if BUILD_ID in FRAME_STEP and NAME == 'main':
     FS_STATE_OFF = KEY_PAGE_OFF + 0x4000
     assert not FAR and FS_STATE_OFF % 0x1000 == 0 and FS_STATE_OFF + 0x40 <= PATCH_OFF and not any(IMG[FS_STATE_OFF:]), 'frame step state page'
@@ -1036,7 +1274,7 @@ if FS_STATE_OFF and BUILD_ID == '277178b7dba1b6d4949a84778d4abc58':
               0x1e270104):  # fmov s4,w8          (original)
         emit(w)
     emit(B(here(), 0xd5cd0))
-    fs_put(0xd5cc0, [B(0xd5cc0, start)], 'view render size x the host render scale (1.0 = original)')
+    fs_put(0xd5cc0, [B(0xd5cc0, start)], 'view render size x the host render scale (1.0 = original)'); RENDER_SCALE = 1
     start = here(); emit(0xbd402906); emit(ADRP(8, here(), FS_STATE_OFF))   # ldr s6,[x8,#0x28] (original: the dynamic multiplier); x8 is dead after it
     for w in (0xbd401107,   # ldr s7,[x8,#0x10]
               0x1e2e1010,   # fmov s16,#1.0
@@ -1107,7 +1345,7 @@ if FS_STATE_OFF and BUILD_ID == 'cd57b23fa4bbad65803d9788c01821ee':
               0xf940ae88):  # orig: ldr x8,[x20,#0x158]
         emit(w)
     emit(B(here(), 0x1266884))
-    fs_put(0x1266880, [B(0x1266880, apply)], '3D view scale = the host render scale (1.0 = the game\'s dynamic resolution)')
+    fs_put(0x1266880, [B(0x1266880, apply)], '3D view scale = the host render scale (1.0 = the game\'s dynamic resolution)'); RENDER_SCALE = 1
     start = here(); emit(ADRP(8, here(), FS_STATE_OFF))
     for w in (0xb9401108,   # ldr w8,[x8,#0x10]      render scale (float bits)
               0x34000088,   # cbz w8,skip (+4)       not set
@@ -1204,6 +1442,234 @@ if FS_STATE_OFF and BUILD_ID == 'c3cf52bf2b05d7310884971b50bcccb8':
         emit(w)
     emit(B(here(), 0x166dc6c))
     fs_put(0x166dc60, [B(0x166dc60, start)], 'KIDS frame task: the frame-rate object\'s steps × its fps × vsyncs per update / 60 (state page target fps; 0 = as the game sets them)')
+# Paper Mario: The Thousand-Year Door 1.0.1: every frame main+0x2e7750 measures the time since the last one, rounds it to 60 Hz vsyncs, clamps it (at least 2 on the Switch, 1 with
+# the cut above) and stores it as the base clock's step (time object +0x44, main+0x2e77f8), which the clocks below it follow (main+0x2e753c). Rounding a frame time between one and
+# two vsyncs down to 1 ran the game slow whenever 60 did not hold (a run at 44 fps took 10-20% longer for each fade). The stub stores the host's step instead, the vsyncs the frame
+# stays on screen, so game time = real time at any rate, and counts the vsyncs stepped. Before the host has decided a step, and at target 0, the game's own. x16 and x17 are dead
+# at the site (the bl to the clock update follows)
+if FS_STATE_OFF and BUILD_ID == '0effe4af1dec3a7966b934d4a7c3d2bf':
+    fs_site(0x2e77f8, '604600bd')
+    start = here(); emit(ADRP(16, here(), FS_STATE_OFF))
+    for w in (0xb9400211,   # ldr w17,[x16]          target fps (float bits; 0 = off)
+              0x34000111,   # cbz w17,orig (+8)
+              0xb9402211,   # ldr w17,[x16,#0x20]    step in vsyncs
+              0x340000d1,   # cbz w17,orig (+6)      not decided yet
+              0x1e230220,   # ucvtf s0,w17           the base clock's step
+              0xf9401a10):  # ldr x16,[x16,#0x30]
+        emit(w)
+    emit(0x8b110210)                                                 # add x16,x16,x17
+    emit(ADRP(17, here(), FS_STATE_OFF)); emit(0xf9001a30)           # str x16,[x17,#0x30]    vsyncs stepped
+    emit(0xbd004660); emit(B(here(), 0x2e77fc))                      # orig: str s0,[x19,#0x44]; back
+    fs_put(0x2e77f8, [B(0x2e77f8, start)], 'frame step: the base clock steps by the host\'s vsyncs (state page target fps; 0 = the game\'s measured step)')
+
+# ---- Spin waits (every module) ----
+# A guest loop that polls memory until another thread changes it fills only its own core on the Switch, where any higher-priority thread pinned there preempts it, so the
+# spin costs the game nothing; on the host it takes a whole core from the threads doing the work. Paper Mario: The Thousand-Year Door's gfx::ParallelManager workers
+# (main+0xa8e680, three, pinned at priority 45) poll their job list this way while a batch is pending; on an iPhone Rogueport ran at 24 fps with the three at 94% of a core each.
+# A loop counts as a spin wait only when it provably cannot leave by itself. From its head T, every pass along the region R (the paths from T back to T, within SPIN_WIN bytes
+# after T) runs only loads, register and flag arithmetic, direct branches and barriers: no store, call, SVC, system register or event wait; and no register or flag that is
+# live at T is written in R (no counter, cursor or delay). One exception: an exclusive add of a constant (ld(a)xr; add/sub #k; st(l)xr; cbnz) that every path back to T
+# undoes on the same address (a worker that registers with a job, sees it finished and backs out). Such a pass leaves memory and registers as it found them, so only another
+# thread can end the loop, and a pause there changes only timing. R is copied into the patch area; the original back-edges jump to the copy (no pause on the first pass, so a
+# single retry costs nothing), the copy's back-edges go through a spin gate, which the host takes as a yield with the yield back-off (hle_thread.c dm_spin_wait), and exits
+# from the copy go back to the original code. The gate keeps every register and the flags (entry.S)
+SPIN_PATHS, SPIN_STEPS = 256, 4096   # complete paths back to T; search steps (R itself lies within SPIN_WIN bytes)
+SPIN_LSE = ('ldadd', 'ldclr', 'ldeor', 'ldset', 'ldsmax', 'ldsmin', 'ldumax', 'ldumin')
+SPIN_BAD = {'bl', 'blr', 'br', 'ret', 'eret', 'svc', 'hvc', 'smc', 'brk', 'hlt', 'udf', 'mrs', 'msr', 'sys', 'sysl', 'wfe', 'wfi', 'sev', 'sevl', 'clrex', 'dc', 'ic', 'at',
+            'tlbi', 'drps', 'dcps1', 'dcps2', 'dcps3', 'blraa', 'blrab', 'blraaz', 'blrabz', 'braa', 'brab', 'braaz', 'brabz', 'retaa', 'retab', 'eretaa', 'eretab'}
+spin_dec = {}
+def spin_ins(a):
+    if a not in spin_dec: spin_dec[a] = next(md.disasm(bytes(IMG[a:a + 4]), a), None)
+    return spin_dec[a]
+def spin_norm(n):
+    n = {'fp': 'x29', 'lr': 'x30', 'wsp': 'sp'}.get(n, n)
+    if n in ('wzr', 'xzr'): return None
+    m = re.fullmatch(r'[wx](\d+)', n)
+    if m: return 'x' + m.group(1)
+    m = re.fullmatch(r'[bhsdqv](\d+)', n)
+    return 'v' + m.group(1) if m else n
+def spin_rw(ins):
+    """(registers read, registers written), w / x and the vector views merged. Capstone's own lists are not enough: it lists a compare's first operand as written and the flags
+    as read by cbz / tbz, and leaves out the destination of adds (sdk+0x31033c in Paper Mario: The Thousand-Year Door, adds w9,w9,#8; b.ne: a counted loop). So every register
+    operand counts as well: operand 0 written and the others read, or for a load all of them written (its address registers are in capstone's reads)"""
+    m = ins.mnemonic
+    regs = [spin_norm(ins.reg_name(o.reg)) for o in ins.operands if o.type == ARM64_OP_REG]
+    ops = set(regs) - {None}
+    if m in ('cbz', 'cbnz', 'tbz', 'tbnz'): return ops, set()
+    if m.startswith('b.'): return {'nzcv'}, set()
+    if m == 'b': return set(), set()
+    if m in ('cmp', 'cmn', 'tst', 'fcmp', 'fcmpe'): return ops, {'nzcv'}
+    if m in ('ccmp', 'ccmn', 'fccmp', 'fccmpe'): return ops | {'nzcv'}, {'nzcv'}
+    r, w = ins.regs_access()
+    r, w = {spin_norm(ins.reg_name(x)) for x in r} - {None}, {spin_norm(ins.reg_name(x)) for x in w} - {None}
+    if m.startswith(('ld', 'prfm', 'prfum')): return r, w | ops
+    return r | (set(regs[1:]) - {None}), w | (set(regs[:1]) - {None})
+def spin_kind(ins):
+    """'br' direct branch, 'pc' adr / adrp, 'ok' a load or register / flag arithmetic, None anything else"""
+    if ins is None: return None
+    m = ins.mnemonic
+    if m in ('b', 'cbz', 'cbnz', 'tbz', 'tbnz') or m.startswith('b.'): return 'br'
+    if m in ('adr', 'adrp'): return 'pc'
+    if m in SPIN_BAD or m.startswith(('st', 'cas', 'swp') + SPIN_LSE): return None
+    mem = any(o.type == ARM64_OP_MEM for o in ins.operands)
+    if m.startswith(('ld', 'prfm', 'prfum')): return 'ok' if mem else None   # no memory operand: a pc-relative literal load
+    return None if mem else 'ok'
+def spin_rmw(a):
+    """ld(a)xr wA,[xN]; add|sub wB,wA,#k; st(l)xr wS,wB,[xN]; cbnz wS,<the load> at a → (xN, ±k, registers written, the four instructions), or None"""
+    l = [spin_ins(a + 4 * i) for i in range(4)]
+    if None in l or l[0].mnemonic not in ('ldxr', 'ldaxr') or l[1].mnemonic not in ('add', 'sub') or l[2].mnemonic not in ('stxr', 'stlxr') or l[3].mnemonic != 'cbnz': return None
+    r = lambda x, i: x.reg_name(x.operands[i].reg)
+    if len(l[1].operands) != 3 or l[1].operands[2].type != ARM64_OP_IMM or 'lsl' in l[1].op_str: return None
+    base = l[0].operands[1].mem
+    if base.disp or base.index or l[2].operands[2].mem.base != base.base or l[2].operands[2].mem.disp: return None
+    if r(l[1], 1) != r(l[0], 0) or r(l[2], 1) != r(l[1], 0) or r(l[3], 0) != r(l[2], 0) or l[3].operands[1].imm != a: return None
+    k = l[1].operands[2].imm * (1 if l[1].mnemonic == 'add' else -1)
+    return spin_norm(l[0].reg_name(base.base)), k, {spin_norm(r(l[0], 0)), spin_norm(r(l[1], 0)), spin_norm(r(l[2], 0))} - {None}, l
+def spin_rebranch(ins, pc, tgt):
+    """the direct branch ins re-encoded at pc with target tgt"""
+    w = struct.unpack('<I', ins.bytes)[0]; off = tgt - pc
+    if ins.mnemonic == 'b': return B(pc, tgt)
+    if ins.mnemonic in ('tbz', 'tbnz'):
+        assert -(1 << 15) <= off < (1 << 15) and off % 4 == 0, f'spin wait tbz out of range {pc:#x}'
+        return (w & ~(0x3FFF << 5)) | (((off >> 2) & 0x3FFF) << 5)
+    assert -(1 << 20) <= off < (1 << 20) and off % 4 == 0, f'spin wait branch out of range {pc:#x}'
+    return (w & ~(0x7FFFF << 5)) | (((off >> 2) & 0x7FFFF) << 5)
+spin_touched = set(kinds) | done | {o for off, oid, ow, why in obs for o in (off,)} | {o for off, ob, nb, why in cuts for o in range(off, off + len(ob) // 2, 4)}
+# Instruction words that end every path through them, told apart by their encoding alone: bl; br / blr / ret; svc / brk; str / strb / strh and the vector str (unsigned offset;
+# unscaled, pre / post-index; register offset); stp / stnp; ldadd and the other LSE atomics. Exclusive stores are left to the full check (the exclusive add), and so are the pre /
+# post-index loads: a seqlock read in SDK 15's nn::time (sdk+0x3d3270) moves a base it sets again on each pass
+SPIN_STOP = ((0xFC000000, 0x94000000), (0xFE000000, 0xD6000000), (0xFF000000, 0xD4000000), (0x3FC00000, 0x39000000), (0x3FC00000, 0x3D000000), (0x3FC00000, 0x3D800000),
+             (0x3FE00000, 0x38000000), (0x3FE00C00, 0x38200800), (0x3FE00000, 0x3C000000), (0x3FE00000, 0x3C800000), (0x3A400000, 0x28000000), (0x3F200C00, 0x38200000))
+def spin_quick(T, hi):
+    """a back-edge to T can be reached from T without passing a word of SPIN_STOP (only such heads get the full check, which decodes)"""
+    seen, todo = set(), [T]
+    while todo:
+        a = todo.pop()
+        if a in seen or not T <= a <= hi: continue
+        seen.add(a); w = struct.unpack_from('<I', IMG, a)[0]; t = w >> 24
+        if 0x14 <= t <= 0x17: succ = (a + (((w & 0x3FFFFFF) ^ 0x2000000) - 0x2000000) * 4,)
+        elif t == 0x54 or t & 0x7E == 0x34: succ = (a + ((((w >> 5) & 0x7FFFF) ^ 0x40000) - 0x40000) * 4, a + 4)
+        elif t & 0x7E == 0x36: succ = (a + ((((w >> 5) & 0x3FFF) ^ 0x2000) - 0x2000) * 4, a + 4)
+        elif any(w & m == v for m, v in SPIN_STOP): continue
+        else: succ = (a + 4,)
+        if T in succ: return True
+        todo.extend(succ)
+    return False
+class SpinNo(Exception): pass
+def spin_region(T, bes):
+    """the spin wait region with head T (bes: the backward branches to T found by the scan) → dict, or None"""
+    hi = max(bes)
+    if any(s < hi + 4 and T < e for s, e in DATA_BLOCKS) or not spin_quick(T, hi): return None
+    nodes, back, bad, inner = {}, set(), set(), set()
+    todo = [T]
+    while todo:
+        a = todo.pop()
+        if a in nodes or a in bad: continue
+        rmw = spin_rmw(a) if a + 12 <= hi and struct.unpack_from('<I', IMG, a)[0] & 0x3FE00000 == 0x08400000 else None   # ldxr / ldaxr
+        if rmw:
+            n = {'kind': 'rmw', 'base': rmw[0], 'k': rmw[1], 'ins': rmw[3], 'uses': {rmw[0]}, 'defs': rmw[2], 'succ': [a + 16]}
+        else:
+            x = spin_ins(a); k = spin_kind(x)
+            if k is None: bad.add(a); continue
+            if k == 'br':
+                t = x.operands[-1].imm
+                succ = [t] if x.mnemonic == 'b' else [t, a + 4]
+            else: succ = [a + 4]
+            n = {'kind': k, 'ins': [x], 'succ': succ}
+        if any(a + 4 * i in spin_touched for i in range(len(n['ins']))): bad.add(a); continue
+        nodes[a] = n
+        if n['kind'] == 'rmw': inner |= {a + 4, a + 8, a + 12}
+        for s in n['succ']:
+            if s == T: back.add(a)
+            elif T < s <= hi: todo.append(s)
+    if not back or inner & set(nodes) or any(s in inner for n in nodes.values() for s in n['succ']): return None
+    def prune(ends):
+        keep, more = set(ends), True
+        while more:
+            more = False
+            for a, n in nodes.items():
+                if a not in keep and any(s in keep and s != T for s in n['succ']): keep.add(a); more = True
+        return keep
+    R = prune(back)
+    for a in R:
+        if 'uses' not in nodes[a]: nodes[a]['uses'], nodes[a]['defs'] = spin_rw(nodes[a]['ins'][0])
+    # every path from T to a back-edge: no inner cycle, and the exclusive adds on each address (a register between two writes to it) sum to 0
+    bad_back, cnt = set(), [0, 0]
+    def walk(a, onpath, ver, delta):
+        cnt[1] += 1
+        if cnt[1] > SPIN_STEPS: raise SpinNo
+        n = nodes[a]
+        if n['kind'] == 'rmw':
+            key = (n['base'], ver.get(n['base'], 0)); delta = dict(delta); delta[key] = delta.get(key, 0) + n['k']
+        if n['defs']: ver = dict(ver); ver.update({r: ver.get(r, 0) + 1 for r in n['defs']})
+        for s in n['succ']:
+            if s == T:
+                cnt[0] += 1
+                if cnt[0] > SPIN_PATHS: raise SpinNo
+                if any(delta.values()): bad_back.add(a)
+            elif s in R:
+                if s in onpath: raise SpinNo
+                walk(s, onpath | {s}, ver, delta)
+    try: walk(T, {T}, {}, {})
+    except SpinNo: return None
+    valid = back - bad_back
+    if not valid: return None
+    R = prune(valid)
+    # no state carried from one pass to the next: nothing live at T is written in R
+    live, more = {a: set() for a in R}, True
+    while more:
+        more = False
+        for a in sorted(R, reverse=True):
+            n, out = nodes[a], set()
+            for s in n['succ']:
+                if s == T: out |= live[T] if a in valid else set()
+                elif s in R: out |= live[s]
+            new = n['uses'] | (out - n['defs'])
+            if new != live[a]: live[a] = new; more = True
+    if live[T] & set().union(*(nodes[a]['defs'] for a in R)): return None
+    return {'T': T, 'R': sorted(R), 'nodes': nodes, 'valid': valid}
+def spin_emit(g):
+    T, R, nodes, valid = g['T'], g['R'], g['nodes'], g['valid']
+    cpy, fixes, tramp = {}, [], {}
+    for i, a in enumerate(R):
+        n = nodes[a]; cpy[a] = here(); x = n['ins'][0]
+        if n['kind'] == 'rmw':
+            for y in n['ins'][:3]: emit(struct.unpack('<I', y.bytes)[0])
+            fixes.append((len(patch), n['ins'][3], a)); emit(0)         # retry: the copy's exclusive load
+        elif n['kind'] == 'pc':
+            rd, tgt = num(spin_norm(x.reg_name(x.operands[0].reg))), x.operands[1].imm
+            emit(ADRP(rd, here(), tgt))
+            if x.mnemonic == 'adr': emit(ADDI(rd, rd, tgt & 0xFFF))
+        elif n['kind'] == 'br': fixes.append((len(patch), x, None)); emit(0)
+        else: emit(struct.unpack('<I', x.bytes)[0])
+        if not (n['kind'] == 'br' and x.mnemonic == 'b'):
+            ft = a + 4 * len(n['ins'])
+            if not (i + 1 < len(R) and R[i + 1] == ft): fixes.append((len(patch), None, ft)); emit(0)   # the next instruction is not the next one copied
+    pause = here()
+    emit(STP_PRE(29, 30, 31, -16)); emit_gate_call(); emit(BLR(30)); ret = here(); emit(LDP_POST(29, 30, 31, 16))
+    gates.append((ret, 'spin', 0, T)); emit(B(here(), cpy[T]))
+    def out(t):   # an exit taken by a conditional branch: through a b next to the copy
+        if t not in tramp: tramp[t] = here(); emit(B(here(), t))
+        return tramp[t]
+    for idx, x, info in fixes:
+        pc = PATCH_OFF + idx
+        if x is None: w = B(pc, cpy.get(info, info))
+        elif info is not None: w = spin_rebranch(x, pc, cpy[info])
+        else:
+            t, cond = x.operands[-1].imm, x.mnemonic != 'b'
+            d = pause if t == T and x.address in valid else cpy[t] if t in cpy and t != T else out(t) if cond else t
+            w = spin_rebranch(x, pc, d)
+        struct.pack_into('<I', patch, idx, w)
+    for b in sorted(valid):   # the original back-edges enter the copy
+        x = nodes[b]['ins'][0]
+        if x.mnemonic == 'b': put_branch(b, cpy[T])
+        else: st = here(); emit(spin_rebranch(x, here(), cpy[T])); emit(B(here(), b + 4)); put_branch(b, st)
+    stat('spin')
+spin_regions = [g for g in (spin_region(T, spin_cand[T]) for T in sorted(spin_cand)) if g]   # all found on the unchanged image first: emitting patches back-edges
+spin_sites = [(g['T'], sorted(g['valid']), sum(len(g['nodes'][a]['ins']) for a in g['R'])) for g in spin_regions]
+for g in spin_regions: spin_emit(g)
+if os.environ.get('DM_SPIN_LIST'):
+    for T, bes, n in spin_sites: print(f'{NAME} spin wait {T:#x} ({n} instructions), back-edges ' + ' '.join(f'{b:#x}' for b in bes))
 
 os.makedirs(outdir, exist_ok=True)
 P = lambda ext: os.path.join(outdir, f'{NAME}.{ext}')
@@ -1224,6 +1690,7 @@ with open(P('fixups.tsv'), 'w') as f:
     if FAR: f.write(f'# IMAGE_SIZE\t{IMAGE_SIZE:#x}\n# FILE_IMAGE_LEN\t{FILE_IMAGE_LEN:#x}\n')   # patch area before the base (negative PATCH_OFF): whole image size, length of the image part of the file
     for k in KEY_INDEX: f.write(f'# KEY_{k}_IDX\t{KEY_INDEX[k]}\n')
     if FS_STATE_OFF: f.write(f'# FPS_STATE_OFF\t{FS_STATE_OFF:#x}\n')   # frame step state page (FRAME_STEP): the loader writes the target fps there
+    if RENDER_SCALE: f.write('# RENDER_SCALE\t1\n')   # a render-scale stub reads state +0x10 (the loader ignores the key; dm/games/settings.py offers the setting by it)
     f.write(f'# BUILD_ID\t{BUILD_ID}\n')   # the host identifies the build by it: features with hard-coded addresses only run on the build they belong to
 with open(P('gates.tsv'), 'w') as f:
     for ret, k, arg, orig in gates: f.write(f'{ret:#x}\t{k}\t{arg}\t{orig:#x}\n')
@@ -1233,6 +1700,7 @@ with open(P('sites.tsv'), 'w') as f:
     for wseg in windows: f.write(f'{wseg[0].address:#x}\tW\t{wseg[-1].address + 4:#x}\n')
     for a, (b, c) in jumps.items(): f.write(f'{a:#x}\tJ\t{b:#x}\t{c}\n')
     for a, tgt in tabjumps.items(): f.write(f'{a:#x}\tT\t' + ' '.join(f'{t:#x}' for t in tgt) + '\n')   # offset-table jump and all its targets
+    for t, bes, n in spin_sites: f.write(f'{t:#x}\tS\t' + ' '.join(f'{b:#x}' for b in bes) + '\n')   # spin wait: its head and the back-edges that enter its copy
 with open(P('cuts.tsv'), 'w') as f:
     f.write(f'# BUILD_ID\t{BUILD_ID}\n')
     for off, ob, nb, why in cuts: f.write(f'{off:#x}\t{ob}\t{nb}\t{why}\n')   # Columns: offset, original bytes, new bytes, reason
