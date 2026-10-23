@@ -4069,6 +4069,7 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
         if (!k->cfmt[i]) continue;
         MTLRenderPipelineColorAttachmentDescriptor *c = d.colorAttachments[i];
         c.pixelFormat = (MTLPixelFormat)k->cfmt[i];
+        BOOL integer_format = mtl_fmt_uint(c.pixelFormat);
         int l = merged ? k->lmap[i] : i;
         uint32_t m = l == 0xff ? 0 : (k->chmask >> (4 * l)) & 0xf;
         // Output numbers the fragment shader does not write: zero write mask, no blending. Maxwell writes only the targets in the shader's output map and leaves the others untouched (whatever the blend state and channel mask);
