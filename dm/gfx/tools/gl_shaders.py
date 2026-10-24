@@ -35,20 +35,14 @@ def text_of(b):
     return b[:z] if z >= 0 else b
 
 def nso_strings(path):
-    """'#version' strings of an NSO's read-only segment (lz4 segments, as dm/tools/nso.py decompresses them)"""
+    """'#version <number>' strings of an NSO's read-only segment (lz4 segments, as dm/tools/nso.py decompresses them); a main that links glslang (Balatro's LÖVE) also has its messages that
+    start with '#version:'"""
     import lz4.block, struct
     d = open(path, 'rb').read()
     flags = struct.unpack_from('<I', d, 0xc)[0]; fo, mo, sz = struct.unpack_from('<III', d, 0x20); csz = struct.unpack_from('<I', d, 0x64)[0]
     img = d[fo:fo + csz]
     if flags >> 1 & 1: img = lz4.block.decompress(img, uncompressed_size=sz)
-    out, i = [], 0
-    while True:
-        i = img.find(b'#version', i)
-        if i < 0: break
-        if i == 0 or img[i - 1] == 0:
-            out.append(text_of(img[i:i + 0x10000]))
-        i += 8
-    return out
+    return [text_of(img[m.start():m.start() + 0x10000]) for m in re.finditer(rb'(?:^|(?<=\0))#version [0-9]', img)]
 
 def sources(roots):
     """(source bytes, stage or None, where) for every shader in the input paths"""
@@ -130,6 +124,8 @@ def translate(src, stage, key, tmp):
         for v in refl.get('inputs', []): f.append(f'a:{v["name"]}={v["location"]}:{v["type"]}')
     else:
         for v in refl.get('outputs', []): f.append(f'o:{v["name"]}={v["location"]}')
+    # a bool uniform is a uint in the SPIR-V block (it has no bool members), but the game asks GL for its declared type: LÖVE's Shader:send takes only a boolean for a GLSL bool
+    bools = {n for n in re.findall(r'\buniform\s+(?:(?:lowp|mediump|highp)\s+)?bool\s+(\w+)\s*;', pre)}
     for u in refl.get('ubos', []):
         t = refl['types'][u['type']]
         if t['name'] != 'gl_DefaultUniformBlock': return f'uniform block {t["name"]} is not the default block'
@@ -138,6 +134,7 @@ def translate(src, stage, key, tmp):
             arr = mb.get('array', [])
             if len(arr) > 1: return f'uniform {mb["name"]}: arrays of arrays'
             ty = glsl_type(mb['type'], refl)
+            if ty == 'uint' and mb['name'] in bools: ty = 'bool'
             if ty not in VEC_TYPES: return f'uniform {mb["name"]}: type {ty} (structs are not implemented)'
             f.append(f'u:{mb["name"]}={mb["offset"]}:{ty}:{arr[0] if arr else 0}:{mb.get("array_stride", 0)}')
     for t in refl.get('textures', []):

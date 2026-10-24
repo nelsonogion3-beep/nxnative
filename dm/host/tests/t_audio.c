@@ -12,7 +12,41 @@ void hle_signal_system_event(void *g) { (void)g; atomic_fetch_add_explicit(&g_si
 void hle_bind_system_event(void *g, int autoclear) { (void)g; (void)autoclear; }   // the real implementation needs a guest thread + SDK kernel event; the unit test only counts triggers
 module_t *module_of(const void *p) { (void)p; return NULL; }   // call sites in the log: no guest modules in the unit test
 void dm_host_helper_qos(qos_class_t q) { (void)q; }   // hle_thread.c: the helper threads keep the default class in the unit test
+
+// Exercise the actual device callback, not just a mixing helper. A stereo
+// device must hear every channel of a 5.1 guest buffer and release the complete
+// six-channel buffers at the same frame count, including a split inside a block.
+static int test_surround_output(void) {
+    enum { FRAMES = 273, SPLIT = 17 };
+    const int16_t expected[8][2] = {
+        {10000, 0}, {0, 10000}, {7070, 7070}, {2509, 2509},
+        {7070, 0}, {0, 7070}, {32767, 32767}, {-32768, -32768}
+    };
+    for (int test = 0; test < 8; test++) {
+        int16_t in[FRAMES * 6] = {0}, out[FRAMES * 2];
+        for (int f = 0; f < FRAMES; f++) for (int ch = 0; ch < 6; ch++)
+            in[f * 6 + ch] = test < 6 ? (test == ch ? 10000 : 0) : test == 6 ? 32767 : -32768;
+        memset(out, 0xa5, sizeof out);
+        gbuf b[2] = {{in, SPLIT * 12, SPLIT * 12}, {in + SPLIT * 6, (FRAMES - SPLIT) * 12, (FRAMES - SPLIT) * 12}};
+        aout a = {.ch = 6};
+        atomic_init(&a.state, STATE_STARTED); atomic_init(&a.vol, 0x3f800000u);
+        a.q[0] = b; a.q[1] = b + 1; atomic_init(&a.q_tail, 2);
+        AudioBufferList bl = {.mNumberBuffers = 1, .mBuffers = {{2, sizeof out, out}}};
+        au_render(&a, NULL, NULL, 0, FRAMES, &bl);
+        for (int f = 0; f < FRAMES; f++) for (int ch = 0; ch < 2; ch++) {
+            if (out[f * 2 + ch] != expected[test][ch]) {
+                printf("FAIL surround callback: case %d frame %d channel %d expected %d got %d\n", test, f, ch, expected[test][ch], out[f * 2 + ch]); return 1;
+            }
+        }
+        if (atomic_load(&a.q_head) != 2 || atomic_load(&a.rel_tail) != 2 || a.rel[0] != b || a.rel[1] != b + 1 || a.pos || atomic_load(&a.under_n)) {
+            puts("FAIL surround callback: guest buffer consumption / release order"); return 1;
+        }
+    }
+    puts("surround callback: all six channels audible, saturation and split-buffer release verified");
+    return 0;
+}
 int main(void) {
+    if (test_surround_output()) return 1;
     char out[64], ev[64]; uint8_t prm[16]; gbuf b[3]; static int16_t pcm[3][4800 * 2];
     h_au_InitParam(prm);
     if (h_au_Open(out, ev, NULL, prm)) return 1;

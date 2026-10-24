@@ -58,3 +58,9 @@ t_view_swizzle
 t_view_swizzle.dSYM/
 t_vk_desc
 t_vk_desc.dSYM/
+t_readback
+t_readback.dSYM/
+t_linear_readback
+t_linear_readback.dSYM/
+t_pso_pending
+t_pso_pending.dSYM/

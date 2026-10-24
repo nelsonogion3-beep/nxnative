@@ -117,6 +117,30 @@ static void pull(aout *a, uint8_t *dst, uint64_t n) {
     }
 }
 
+// A six-channel output (front-left front-right center LFE back-left back-right) goes to the device as stereo, downmixed here with the audio renderer's default Q15 coefficients (hle_audren.c):
+// Core Audio's own 6 → 2 mapping keeps only the front pair, so voices on the center (Luigi's Mansion 3) and the back channels were silent. The queue still takes all six guest channels,
+// in blocks through a stack buffer (no allocation in the real-time callback)
+static int device_channels(const aout *a) { return a->ch == 6 ? 2 : a->ch; }
+static void pull_device(aout *a, uint8_t *dst, uint64_t bytes) {
+    if (a->ch != 6) { pull(a, dst, bytes); return; }
+    enum { BLOCK = 128, CF = 32768, CC = 23167, CL = 8224, CB = 23167 };
+    int16_t scratch[BLOCK * 6], *out = (int16_t *)dst;
+    uint64_t frames = bytes / (2 * sizeof *out);
+    while (frames) {
+        uint64_t n = frames < BLOCK ? frames : BLOCK;
+        pull(a, (uint8_t *)scratch, n * 6 * sizeof *scratch);
+        for (uint64_t i = 0; i < n; i++) {
+            const int16_t *p = scratch + 6 * i;
+            int64_t c = (int64_t)p[2] * CC + (int64_t)p[3] * CL;
+            int64_t l = ((int64_t)p[0] * CF + c + (int64_t)p[4] * CB) >> 15;
+            int64_t r = ((int64_t)p[1] * CF + c + (int64_t)p[5] * CB) >> 15;
+            *out++ = (int16_t)(l > 32767 ? 32767 : l < -32768 ? -32768 : l);
+            *out++ = (int16_t)(r > 32767 ? 32767 : r < -32768 ? -32768 : r);
+        }
+        frames -= n;
+    }
+}
+
 static _Atomic uint64_t g_render_calls;   // Cumulative sound card callbacks (lifecycle verification: must keep growing after resume)
 uint64_t dm_audio_render_calls(void) { return atomic_load_explicit(&g_render_calls, memory_order_relaxed); }
 static OSStatus au_render(void *ctx, AudioUnitRenderActionFlags *f, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *bl) {
@@ -131,7 +155,7 @@ static OSStatus au_render(void *ctx, AudioUnitRenderActionFlags *f, const AudioT
         if (++a->st_calls % 2000 == 0) { uint64_t un = atomic_load(&a->under_n), ubb = atomic_load(&a->under_b);
             LOG("audio #%d device callbacks %llu: %u–%u frames each, %.1f blocks queued on average at callback; in these 2000, %llu underruns, %.1f ms zero-padded", a->id, (unsigned long long)a->st_calls, a->st_fmin, a->st_fmax, a->st_qsum / 2000.0,
                 (unsigned long long)(un - a->st_u0), (ubb - a->st_ub0) / (2.0 * a->ch) / (RATE / 1000.0)); a->st_fmin = ~0u; a->st_fmax = 0; a->st_qsum = 0; a->st_u0 = un; a->st_ub0 = ubb; } }
-    pull(a, bl->mBuffers[0].mData, bl->mBuffers[0].mDataByteSize);
+    pull_device(a, bl->mBuffers[0].mData, bl->mBuffers[0].mDataByteSize);
     { static int mute = -1; if (mute < 0) { const char *e = getenv("DM_AUDIO_MUTE"); mute = e && atoi(e); }   // diagnostic: the whole real-output path (AudioUnit callback pacing, background take-over) but with the output silenced (lifecycle tests on the Mac without noise)
       if (mute) memset(bl->mBuffers[0].mData, 0, bl->mBuffers[0].mDataByteSize); }
     return noErr;
@@ -146,10 +170,11 @@ static OSStatus au_create(aout *a) {
                                    .componentManufacturer = kAudioUnitManufacturer_Apple};
     AudioComponent c = AudioComponentFindNext(NULL, &d);
     a->au = NULL; if (!c || AudioComponentInstanceNew(c, &a->au)) { a->au = NULL; return -1; }
+    unsigned ch = (unsigned)device_channels(a);
     AudioStreamBasicDescription f = {.mSampleRate = RATE, .mFormatID = kAudioFormatLinearPCM,
                                      .mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked,
-                                     .mBytesPerPacket = 2u * a->ch, .mFramesPerPacket = 1, .mBytesPerFrame = 2u * a->ch,
-                                     .mChannelsPerFrame = (UInt32)a->ch, .mBitsPerChannel = 16};
+                                     .mBytesPerPacket = 2u * ch, .mFramesPerPacket = 1, .mBytesPerFrame = 2u * ch,
+                                     .mChannelsPerFrame = ch, .mBitsPerChannel = 16};
     AURenderCallbackStruct cb = {au_render, a};
 #if !TARGET_OS_IPHONE
     { const char *e = getenv("DM_DBG_AU_FRAMES"); if (e) {   // diagnostic: on the Mac, make the sound card callback ask N frames each time (1024 = the iOS default, reproduces the crackling)
